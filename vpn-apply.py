@@ -1,789 +1,849 @@
 #!/usr/bin/env python3
 """
-VPN Policy Router Application
-
-This script applies VPN routing policies based on client assignments.
+VPN Policy Router Configuration Apply Script
+This script applies the VPN router configuration from JSON definitions
 """
 
 import os
-import re
 import sys
+import re
 import json
+import time
 import hashlib
-import logging
-import argparse
+import shutil
 import subprocess
+import argparse
+import logging
+import ipaddress
 from pathlib import Path
-from typing import List, Dict, Set, Union, Optional
-from datetime import datetime, timezone
-
-# Constants
-CONFIG_DIR = Path("/etc/vpn-router")
-VPN_DEFINITIONS_PATH = CONFIG_DIR / "vpn-definitions.json"
-VPN_CLIENTS_PATH = CONFIG_DIR / "vpn-clients.json"
-NETWORKD_PATH = Path("/etc/systemd/network")
-
-# Default resource ranges
-DEFAULT_ROUTING_TABLE_ID_MIN = 7001
-DEFAULT_ROUTING_TABLE_ID_MAX = 7200
-DEFAULT_VETH_NETWORK_PREFIX = "10.239"
-
-# ANSI colors for terminal output
-GREEN = '\033[0;32m'
-YELLOW = '\033[0;33m'
-RED = '\033[0;31m'
-NC = '\033[0m'  # No Color
+from datetime import datetime
+import pwd
+import getpass
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('/var/log/vpn-router.log')
-    ]
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger('vpn-router')
 
+# Base directories
+CONFIG_DIR = Path("/etc/vpn-router")
+NETWORKD_DIR = Path("/etc/systemd/network")
+SYSTEMD_DIR = Path("/etc/systemd/system")
+
+# Config file paths
+VPN_DEFINITIONS_PATH = CONFIG_DIR / "vpn-definitions.json"
+VPN_CLIENTS_PATH = CONFIG_DIR / "vpn-clients.json"
+
+# Default values
+DEFAULT_NETWORK_PREFIX = "10.239"
+DEFAULT_MIN_TABLE_ID = 7001
+DEFAULT_MAX_TABLE_ID = 7200
+
+# Metadata for generated files
+GENERATOR_VERSION = "1.0"
+GENERATOR_NAME = "vpn-apply.py"
+
+
 class VPNRouter:
-    """
-    VPN Router class to manage policy-based routing for multiple VPN connections
-    """
+    """VPN Router configuration manager"""
     
     def __init__(self, dry_run=False, auto_mode=False, force_overwrite=False, clean_orphaned=False):
-        """Initialize the VPN Router"""
+        """Initialize the VPN Router manager"""
         self.dry_run = dry_run
         self.auto_mode = auto_mode
         self.force_overwrite = force_overwrite
         self.clean_orphaned = clean_orphaned
+        self.changed_files = []
+        self.created_resources = []
         
-        # Configuration data
-        self.vpn_definitions = {}
-        self.client_assignments = {}
-        self.resolved_assignments = []
+        self.vpn_definitions = self._load_json(VPN_DEFINITIONS_PATH)
+        self.vpn_clients = self._load_json(VPN_CLIENTS_PATH)
         
-        # Resource ranges (will be loaded from config)
-        self.routing_table_id_min = DEFAULT_ROUTING_TABLE_ID_MIN
-        self.routing_table_id_max = DEFAULT_ROUTING_TABLE_ID_MAX
-        self.veth_network_prefix = DEFAULT_VETH_NETWORK_PREFIX
+        # Create config skeleton if empty
+        if not self.vpn_definitions:
+            self.vpn_definitions = {
+                "system_config": {
+                    "routing_table_id_range": {
+                        "min": DEFAULT_MIN_TABLE_ID,
+                        "max": DEFAULT_MAX_TABLE_ID
+                    },
+                    "veth_network_range": {
+                        "prefix": DEFAULT_NETWORK_PREFIX
+                    }
+                },
+                "vpn_connections": []
+            }
+            
+        if not self.vpn_clients:
+            self.vpn_clients = {
+                "assignments": []
+            }
+            
+        # Validate configuration
+        self._validate_config()
         
-        # Track active and removed VPNs
-        self.active_vpns = set()
-        self.removed_vpns = set()
-        
-        # Current timestamp and user login
-        self.current_timestamp = "2025-08-09 19:49:21"  # Updated timestamp
-        self.current_user = "gtstudyes"  # User login
-        
-        logger.info(f"VPN Router initialized by {self.current_user} at {self.current_timestamp} (dry_run={dry_run}, auto_mode={auto_mode}, force_overwrite={force_overwrite})")
-        
-    def load_configuration(self) -> bool:
-        """Load and validate configuration files"""
+    def _load_json(self, path):
+        """Load JSON from file"""
         try:
-            # Load VPN definitions
-            with open(VPN_DEFINITIONS_PATH, 'r') as f:
-                self.vpn_definitions = json.load(f)
-                
-            # Load client assignments
-            with open(VPN_CLIENTS_PATH, 'r') as f:
-                self.client_assignments = json.load(f)
-                
-            # Extract system configuration or use defaults
-            if "system_config" in self.vpn_definitions:
-                sys_config = self.vpn_definitions["system_config"]
-                if "routing_table_id_range" in sys_config:
-                    self.routing_table_id_min = sys_config["routing_table_id_range"].get("min", DEFAULT_ROUTING_TABLE_ID_MIN)
-                    self.routing_table_id_max = sys_config["routing_table_id_range"].get("max", DEFAULT_ROUTING_TABLE_ID_MAX)
-                else:
-                    logger.warning("No routing_table_id_range found in system_config, using defaults")
-                
-                if "veth_network_range" in sys_config:
-                    self.veth_network_prefix = sys_config["veth_network_range"].get("prefix", DEFAULT_VETH_NETWORK_PREFIX)
-                else:
-                    logger.warning("No veth_network_range found in system_config, using defaults")
+            if path.exists():
+                with open(path, 'r') as f:
+                    return json.load(f)
             else:
-                logger.warning("No system_config found in vpn-definitions.json, using default ranges")
-                
-            logger.info(f"Configuration loaded successfully")
-            logger.info(f"Using routing table ID range: {self.routing_table_id_min}-{self.routing_table_id_max}")
-            logger.info(f"Using veth network prefix: {self.veth_network_prefix}")
-            return True
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parsing error: {e}")
-            return False
-        except FileNotFoundError as e:
-            logger.error(f"Configuration file not found: {e}")
-            return False
+                logger.warning(f"Config file not found: {path}")
+                return {}
+        except json.JSONDecodeError:
+            logger.error(f"Invalid JSON in {path}")
+            if self.auto_mode:
+                logger.error("Exiting due to invalid configuration")
+                sys.exit(1)
+            else:
+                if self._prompt_yes_no(f"Config file {path} contains invalid JSON. Continue with empty config?"):
+                    return {}
+                else:
+                    logger.error("Exiting due to invalid configuration")
+                    sys.exit(1)
         except Exception as e:
-            logger.error(f"Error loading configuration: {e}")
-            return False
-    
-    def validate_configuration(self) -> bool:
-        """Validate the configuration"""
-        valid = True
+            logger.error(f"Error loading config file {path}: {e}")
+            if self.auto_mode:
+                logger.error("Exiting due to configuration error")
+                sys.exit(1)
+            else:
+                if self._prompt_yes_no(f"Error loading config file {path}. Continue with empty config?"):
+                    return {}
+                else:
+                    logger.error("Exiting due to configuration error")
+                    sys.exit(1)
+                    
+    def _validate_config(self):
+        """Validate configuration for required fields and formats"""
+        # Validate system_config
+        if "system_config" not in self.vpn_definitions:
+            logger.error("Missing 'system_config' in vpn-definitions.json")
+            sys.exit(1)
+            
+        system_config = self.vpn_definitions["system_config"]
         
-        # Check that VPN definitions exist
+        # Validate routing_table_id_range
+        if "routing_table_id_range" not in system_config:
+            logger.error("Missing 'routing_table_id_range' in system_config")
+            sys.exit(1)
+            
+        table_range = system_config["routing_table_id_range"]
+        if "min" not in table_range or "max" not in table_range:
+            logger.error("Missing 'min' or 'max' in routing_table_id_range")
+            sys.exit(1)
+            
+        # Validate veth_network_range
+        if "veth_network_range" not in system_config:
+            logger.error("Missing 'veth_network_range' in system_config")
+            sys.exit(1)
+            
+        network_range = system_config["veth_network_range"]
+        if "prefix" not in network_range:
+            logger.error("Missing 'prefix' in veth_network_range")
+            sys.exit(1)
+            
+        # Validate VPN connections
         if "vpn_connections" not in self.vpn_definitions:
-            logger.error("Missing vpn_connections in VPN definitions")
-            return False
+            logger.error("Missing 'vpn_connections' in vpn-definitions.json")
+            sys.exit(1)
             
-        # Check that client assignments exist
-        if "assignments" not in self.client_assignments:
-            logger.error("Missing assignments in client assignments")
-            return False
-            
-        # Track used IDs and networks to check for duplicates
-        used_table_ids = set()
-        used_networks = set()
-        
-        # Validate each VPN connection
-        for vpn in self.vpn_definitions["vpn_connections"]:
-            # Check required fields
-            required_fields = ["name", "peer_endpoint", "peer_public_key", "client_private_key", 
-                              "vpn_assigned_ip", "routing_table_id", "veth_network"]
-                              
-            for field in required_fields:
-                if field not in vpn:
-                    logger.error(f"Missing required field '{field}' in VPN '{vpn.get('name', '(unnamed)')}'")
-                    valid = False
-            
-            # Validate routing_table_id is in range
-            if "routing_table_id" in vpn:
-                try:
-                    table_id = int(vpn["routing_table_id"])
-                    if not (self.routing_table_id_min <= table_id <= self.routing_table_id_max):
-                        logger.error(f"Routing table ID {table_id} for VPN '{vpn['name']}' is outside configured range " +
-                                    f"({self.routing_table_id_min}-{self.routing_table_id_max})")
-                        valid = False
-                        
-                    # Check for duplicate table IDs
-                    if table_id in used_table_ids:
-                        logger.error(f"Duplicate routing table ID {table_id} used by VPN '{vpn['name']}'")
-                        valid = False
-                    used_table_ids.add(table_id)
-                except ValueError:
-                    logger.error(f"Invalid routing table ID '{vpn['routing_table_id']}' for VPN '{vpn['name']}'")
-                    valid = False
+        for i, vpn in enumerate(self.vpn_definitions["vpn_connections"]):
+            if "name" not in vpn:
+                logger.error(f"Missing 'name' in VPN connection at index {i}")
+                sys.exit(1)
                 
-            # Validate veth_network uses our prefix
-            if "veth_network" in vpn:
-                network = vpn["veth_network"]
-                if not network.startswith(f"{self.veth_network_prefix}."):
-                    logger.error(f"veth network {network} for VPN '{vpn['name']}' is outside configured range " +
-                                f"(should start with {self.veth_network_prefix})")
-                    valid = False
-                    
-                # Check for duplicate networks
-                if network in used_networks:
-                    logger.error(f"Duplicate veth network {network} used by VPN '{vpn['name']}'")
-                    valid = False
-                used_networks.add(network)
-        
+            if "type" not in vpn:
+                logger.error(f"Missing 'type' in VPN connection {vpn['name']}")
+                sys.exit(1)
+                
+            if vpn["type"] not in ["wireguard", "openvpn"]:
+                logger.error(f"Invalid 'type' in VPN connection {vpn['name']}: {vpn['type']}")
+                logger.error("Supported types are 'wireguard' and 'openvpn'")
+                sys.exit(1)
+                
+            if "routing_table_id" not in vpn:
+                logger.error(f"Missing 'routing_table_id' in VPN connection {vpn['name']}")
+                sys.exit(1)
+                
+            if "veth_network" not in vpn:
+                logger.error(f"Missing 'veth_network' in VPN connection {vpn['name']}")
+                sys.exit(1)
+                
+            # Check for duplicate names
+            vpn_names = [v["name"] for v in self.vpn_definitions["vpn_connections"]]
+            if vpn_names.count(vpn["name"]) > 1:
+                logger.error(f"Duplicate VPN name found: {vpn['name']}")
+                sys.exit(1)
+                
+            # Check for duplicate routing table IDs
+            table_ids = [v["routing_table_id"] for v in self.vpn_definitions["vpn_connections"]]
+            if table_ids.count(vpn["routing_table_id"]) > 1:
+                logger.error(f"Duplicate routing table ID found: {vpn['routing_table_id']}")
+                sys.exit(1)
+                
+            # Check for duplicate veth networks
+            veth_networks = [v["veth_network"] for v in self.vpn_definitions["vpn_connections"]]
+            if veth_networks.count(vpn["veth_network"]) > 1:
+                logger.error(f"Duplicate veth network found: {vpn['veth_network']}")
+                sys.exit(1)
+                
+            # Validate veth network format (should be a number between 0-255)
+            try:
+                network_num = int(vpn["veth_network"])
+                if network_num < 0 or network_num > 255:
+                    logger.error(f"Invalid veth network number in {vpn['name']}: {vpn['veth_network']}")
+                    logger.error("Network number should be between 0-255")
+                    sys.exit(1)
+            except ValueError:
+                logger.error(f"Invalid veth network format in {vpn['name']}: {vpn['veth_network']}")
+                logger.error("Network should be a number between 0-255")
+                sys.exit(1)
+                
         # Validate client assignments
-        for client in self.client_assignments["assignments"]:
-            # Check required fields
-            if "client_ip" not in client and "hostname" not in client:
-                logger.error(f"Client must have either client_ip or hostname: {client}")
-                valid = False
-                
-            if "assigned_vpn" in client:
-                # Check that assigned VPN exists
-                vpn_exists = any(vpn["name"] == client["assigned_vpn"] 
-                                for vpn in self.vpn_definitions["vpn_connections"])
-                if not vpn_exists:
-                    logger.error(f"Client {client.get('display_name', client.get('client_ip', client.get('hostname', 'unknown')))} " +
-                                f"is assigned to non-existent VPN '{client['assigned_vpn']}'")
-                    valid = False
-        
-        logger.info(f"Configuration validation {'passed' if valid else 'failed'}")
-        return valid
-    
-    def resolve_hostname_assignments(self) -> None:
-        """Resolve hostnames to IPs for client assignments"""
-        logger.info("Resolving hostname assignments...")
-        
-        self.resolved_assignments = []
-        
-        for client in self.client_assignments["assignments"]:
-            resolved_client = client.copy()
+        if "assignments" not in self.vpn_clients:
+            logger.error("Missing 'assignments' in vpn-clients.json")
+            sys.exit(1)
             
-            # If client already has an IP, use it
-            if "client_ip" in client:
-                resolved_client["resolved_ip"] = client["client_ip"]
-                self.resolved_assignments.append(resolved_client)
-                continue
-                
-            # If client has a hostname, try to resolve it
-            if "hostname" in client:
-                hostname = client["hostname"]
-                try:
-                    # Use getent hosts to resolve hostname
-                    result = subprocess.run(
-                        ["getent", "hosts", hostname], 
-                        capture_output=True, 
-                        text=True
-                    )
-                    
-                    if result.returncode == 0:
-                        # Extract the first IP from the output
-                        ip = result.stdout.split()[0]
-                        resolved_client["resolved_ip"] = ip
-                        logger.info(f"Resolved hostname {hostname} to {ip}")
-                        self.resolved_assignments.append(resolved_client)
-                    else:
-                        logger.error(f"Failed to resolve hostname {hostname}")
-                except Exception as e:
-                    logger.error(f"Error resolving hostname {hostname}: {e}")
-            else:
-                logger.warning(f"Client has neither client_ip nor hostname: {client}")
-                
-        logger.info(f"Resolved {len(self.resolved_assignments)} client assignments")
-    
-    def identify_active_and_removed_vpns(self) -> None:
-        """Identify which VPNs are active and which need to be removed"""
-        # Get all VPN names from the current config
-        self.active_vpns = {vpn["name"] for vpn in self.vpn_definitions["vpn_connections"]}
+        valid_vpn_names = set(vpn["name"] for vpn in self.vpn_definitions["vpn_connections"])
         
-        # Find previously configured VPNs that are no longer in the config
-        existing_vpns = set()
+        for i, assignment in enumerate(self.vpn_clients["assignments"]):
+            if "client_id" not in assignment:
+                logger.error(f"Missing 'client_id' in assignment at index {i}")
+                sys.exit(1)
+                
+            if "vpn" not in assignment:
+                logger.error(f"Missing 'vpn' in assignment for client {assignment['client_id']}")
+                sys.exit(1)
+                
+            if assignment["vpn"] not in valid_vpn_names and assignment["vpn"] != "direct":
+                logger.error(f"Invalid VPN name in assignment for client {assignment['client_id']}: {assignment['vpn']}")
+                logger.error(f"Valid VPN names are: {', '.join(valid_vpn_names)} or 'direct'")
+                sys.exit(1)
+                
+            # Check for duplicate client IDs
+            client_ids = [a["client_id"] for a in self.vpn_clients["assignments"]]
+            if client_ids.count(assignment["client_id"]) > 1:
+                logger.error(f"Duplicate client ID found: {assignment['client_id']}")
+                sys.exit(1)
+                
+        logger.info("Configuration validation successful")
         
-        # Check network namespaces
+    def _generate_file_metadata(self, content_hash):
+        """Generate metadata for managed files"""
+        metadata = (
+            f"# Generated by {GENERATOR_NAME} v{GENERATOR_VERSION}\n"
+            f"# Hash: {content_hash}\n"
+            f"# DO NOT EDIT - This file is managed by vpn-router\n\n"
+        )
+        return metadata
+        
+    def _calculate_content_hash(self, content):
+        """Calculate SHA-256 hash of content"""
+        return hashlib.sha256(content.encode('utf-8')).hexdigest()
+        
+    def _extract_hash_from_file(self, file_path):
+        """Extract the content hash from file metadata"""
         try:
-            ns_output = subprocess.run(["ip", "netns", "list"], 
-                                      capture_output=True, text=True).stdout
+            with open(file_path, 'r') as f:
+                content = f.read()
+                
+            # Look for the hash line in the metadata
+            hash_match = re.search(r'^# Hash: ([a-f0-9]{64})$', content, re.MULTILINE)
+            if hash_match:
+                return hash_match.group(1)
+                
+            return None
+        except Exception:
+            return None
             
-            for line in ns_output.splitlines():
-                if line.strip() and line.strip().startswith("ns-"):
-                    vpn_name = line.strip().split("ns-")[1].split()[0]  # Extract name from "ns-<name>"
-                    existing_vpns.add(vpn_name)
-        except Exception as e:
-            logger.error(f"Error checking network namespaces: {e}")
-            
-        # Check interfaces
+    def _extract_content_without_metadata(self, file_content):
+        """Extract the file content without metadata"""
         try:
-            if_output = subprocess.run(["ip", "link", "show"], 
-                                      capture_output=True, text=True).stdout
+            # Find the end of the metadata section
+            metadata_end = file_content.find("# DO NOT EDIT - This file is managed by vpn-router\n\n")
             
-            # Look for interfaces matching our pattern
-            if_pattern = re.compile(r"v-([a-zA-Z0-9_-]+)-[wvp]")
-            for match in if_pattern.finditer(if_output):
-                vpn_name = match.group(1)
-                existing_vpns.add(vpn_name)
-        except Exception as e:
-            logger.error(f"Error checking network interfaces: {e}")
+            if metadata_end != -1:
+                # Return everything after the metadata section
+                return file_content[metadata_end + len("# DO NOT EDIT - This file is managed by vpn-router\n\n"):]
             
-        # Identify removed VPNs
-        self.removed_vpns = existing_vpns - self.active_vpns
+            return file_content
+        except Exception:
+            return file_content
+            
+    def _write_file(self, path, content, mode=0o644):
+        """Write content to file with proper error handling"""
+        # Add metadata to the content
+        content_hash = self._calculate_content_hash(content)
+        metadata = self._generate_file_metadata(content_hash)
+        full_content = metadata + content
         
-        logger.info(f"Found {len(self.active_vpns)} active VPNs")
-        logger.info(f"Found {len(self.removed_vpns)} VPNs to remove: {', '.join(self.removed_vpns) if self.removed_vpns else 'none'}")
-    
-    def cleanup_removed_vpns(self) -> None:
-        """Clean up VPNs that have been removed from configuration"""
-        if not self.removed_vpns:
-            logger.info("No VPNs to remove")
-            return
-            
         if self.dry_run:
-            logger.info("=== DRY RUN MODE - Would clean up removed VPNs ===")
-            for vpn_name in self.removed_vpns:
-                logger.info(f"Would remove VPN: {vpn_name}")
-            return
-            
-        for vpn_name in self.removed_vpns:
-            logger.info(f"Cleaning up removed VPN: {vpn_name}")
-            
-            # Stop and disable systemd service if exists
-            service_name = f"vpn-ns-{vpn_name}.service"
-            try:
-                # Check if service exists
-                service_check = subprocess.run(
-                    ["systemctl", "status", service_name],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
-                
-                if service_check.returncode != 4:  # 4 = unit not found
-                    logger.info(f"Stopping and disabling service: {service_name}")
-                    subprocess.run(["systemctl", "stop", service_name],
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    subprocess.run(["systemctl", "disable", service_name],
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            except Exception as e:
-                logger.error(f"Error stopping service {service_name}: {e}")
-                
-            # Remove network namespace
-            try:
-                ns_name = f"ns-{vpn_name}"
-                ns_check = subprocess.run(
-                    ["ip", "netns", "list"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                
-                if ns_name in ns_check.stdout:
-                    logger.info(f"Removing network namespace: {ns_name}")
-                    subprocess.run(["ip", "netns", "del", ns_name],
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            except Exception as e:
-                logger.error(f"Error removing network namespace ns-{vpn_name}: {e}")
-                
-            # Remove veth interfaces
-            interface_prefixes = [f"v-{vpn_name}-v", f"v-{vpn_name}-p", f"v-{vpn_name}-w"]
-            for prefix in interface_prefixes:
-                try:
-                    logger.info(f"Removing interface if exists: {prefix}")
-                    # Try to delete interface (will fail silently if it doesn't exist)
-                    subprocess.run(["ip", "link", "del", prefix],
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                except Exception as e:
-                    logger.error(f"Error removing interface {prefix}: {e}")
-                    
-            # Remove routing table entries
-            try:
-                rt_tables_d_path = Path("/etc/iproute2/rt_tables.d")
-                if rt_tables_d_path.exists():
-                    for file_path in rt_tables_d_path.glob(f"{vpn_name}_*.conf"):
-                        logger.info(f"Removing routing table file: {file_path}")
-                        file_path.unlink(missing_ok=True)
-            except Exception as e:
-                logger.error(f"Error removing routing table files for {vpn_name}: {e}")
-                
-            # Remove systemd-networkd config files
-            try:
-                for pattern in [f"10-v-{vpn_name}-*.netdev", f"10-v-{vpn_name}-*.network", 
-                               f"20-v-{vpn_name}-*.netdev", f"20-v-{vpn_name}-*.network",
-                               f"50-{vpn_name}-client-*.network"]:  # Changed from .rules to .network
-                    for file_path in NETWORKD_PATH.glob(pattern):
-                        logger.info(f"Removing networkd file: {file_path}")
-                        file_path.unlink(missing_ok=True)
-            except Exception as e:
-                logger.error(f"Error removing networkd files for {vpn_name}: {e}")
-                
-            # Remove systemd service file
-            try:
-                service_path = Path(f"/etc/systemd/system/{service_name}")
-                if service_path.exists():
-                    logger.info(f"Removing service file: {service_path}")
-                    service_path.unlink()
-            except Exception as e:
-                logger.error(f"Error removing service file {service_name}: {e}")
-                
-        # Reload systemd and networkd
-        try:
-            logger.info("Reloading systemd daemon")
-            subprocess.run(["systemctl", "daemon-reload"],
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                          
-            logger.info("Reloading networkd")
-            subprocess.run(["networkctl", "reload"],
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except Exception as e:
-            logger.error(f"Error reloading services: {e}")
-            
-        logger.info("Cleanup of removed VPNs completed")
-    
-    def write_file_with_marker(self, path: Path, content: str, vpn_name: str) -> bool:
-        """Write a file with a marker identifying it as generated by VPN Router"""
-        timestamp = self.current_timestamp  # Use the provided timestamp
-        
-        # Calculate checksum of the actual content (without the marker)
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
-        
-        # Create a marker that includes:
-        # 1. Identification as a VPN Router generated file
-        # 2. The VPN name this file is associated with
-        # 3. A timestamp for debugging
-        # 4. A checksum of the file content (excluding marker)
-        # 5. The user who generated it
-        marker = (f"# Generated by VPN-Router v1.0\n"
-                  f"# Associated VPN: {vpn_name}\n"
-                  f"# Generated at: {timestamp}\n"
-                  f"# Generated by: {self.current_user}\n"
-                  f"# Content-Hash: {content_hash}\n"
-                  f"# DO NOT EDIT: Changes may be lost on next update\n\n")
-        
-        # Add marker to beginning of file
-        marked_content = marker + content
-        
-        try:
-            # Ensure parent directories exist
-            path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Write the file
-            with open(path, 'w') as f:
-                f.write(marked_content)
-                
-            logger.info(f"Wrote file: {path}")
+            logger.info(f"Would write to file: {path}")
             return True
+            
+        try:
+            # Ensure parent directory exists
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            
+            # Check if file exists and has different content
+            file_exists = os.path.exists(path)
+            content_changed = True
+            is_modified = False
+            
+            if file_exists:
+                try:
+                    with open(path, 'r') as f:
+                        existing_content = f.read()
+                    
+                    # Check if the file is managed by vpn-router
+                    if "# Generated by vpn-apply.py" in existing_content and "# DO NOT EDIT" in existing_content:
+                        # Extract the original hash
+                        original_hash = self._extract_hash_from_file(path)
+                        
+                        if original_hash:
+                            # Extract content without metadata
+                            existing_content_without_metadata = self._extract_content_without_metadata(existing_content)
+                            
+                            # Calculate hash of existing content
+                            actual_hash = self._calculate_content_hash(existing_content_without_metadata)
+                            
+                            # Check if the file was manually modified
+                            is_modified = original_hash != actual_hash
+                            
+                    # Check if the content has changed compared to what we want to write
+                    content_changed = existing_content != full_content
+                except Exception:
+                    # If can't read existing file, assume content changed
+                    content_changed = True
+                    
+            if not file_exists or content_changed:
+                if file_exists and is_modified and not self.force_overwrite and not self.auto_mode:
+                    if not self._prompt_yes_no(f"File {path} has been manually modified. Overwrite?"):
+                        logger.warning(f"Skipping file: {path}")
+                        return False
+                elif file_exists and content_changed and not self.force_overwrite and not self.auto_mode:
+                    if not self._prompt_yes_no(f"File {path} exists and has different content. Overwrite?"):
+                        logger.warning(f"Skipping file: {path}")
+                        return False
+                        
+                with open(path, 'w') as f:
+                    f.write(full_content)
+                os.chmod(path, mode)
+                logger.info(f"Wrote file: {path}")
+                self.changed_files.append(str(path))
+                return True
+            else:
+                logger.debug(f"File unchanged, skipping: {path}")
+                return True
         except Exception as e:
-            logger.error(f"Failed to write file {path}: {e}")
+            logger.error(f"Error writing file {path}: {e}")
             return False
-    
-    def generate_veth_netdev_file(self, vpn: Dict) -> None:
-        """Generate veth netdev configuration file"""
+            
+    def _prompt_yes_no(self, question):
+        """Prompt user for yes/no answer"""
+        if self.auto_mode:
+            return True
+            
+        while True:
+            answer = input(f"{question} [y/n]: ").lower().strip()
+            if answer in ['y', 'yes']:
+                return True
+            elif answer in ['n', 'no']:
+                return False
+                
+    def _restart_systemd_service(self, service_name):
+        """Restart systemd service"""
+        if self.dry_run:
+            logger.info(f"Would restart systemd service: {service_name}")
+            return True
+            
+        try:
+            logger.info(f"Restarting systemd service: {service_name}")
+            subprocess.run(["systemctl", "restart", service_name], check=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to restart service {service_name}: {e}")
+            return False
+            
+    def _restart_systemd_networkd(self):
+        """Restart systemd-networkd service"""
+        if self.dry_run:
+            logger.info("Would restart systemd-networkd")
+            return True
+            
+        try:
+            logger.info("Restarting systemd-networkd...")
+            subprocess.run(["systemctl", "restart", "systemd-networkd.service"], check=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to restart systemd-networkd: {e}")
+            return False
+            
+    def _apply_wireguard_config(self, vpn):
+        """Apply WireGuard VPN configuration"""
         vpn_name = vpn["name"]
-        content = f"""[NetDev]
+        veth_network = vpn["veth_network"]
+        routing_table_id = vpn["routing_table_id"]
+        network_prefix = self.vpn_definitions["system_config"]["veth_network_range"]["prefix"]
+        
+        logger.info(f"Applying WireGuard VPN configuration for {vpn_name}")
+        
+        # Create namespace service file
+        ns_service_content = f"""[Unit]
+Description=Network Namespace for VPN {vpn_name}
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/ip netns add ns-{vpn_name}
+ExecStop=/usr/bin/ip netns del ns-{vpn_name}
+
+[Install]
+WantedBy=multi-user.target
+"""
+        ns_service_path = SYSTEMD_DIR / f"vpn-ns-{vpn_name}.service"
+        self._write_file(ns_service_path, ns_service_content)
+        
+        # Create veth pair .netdev file
+        veth_netdev_content = f"""[NetDev]
 Name=v-{vpn_name}-v
 Kind=veth
 
 [Peer]
 Name=v-{vpn_name}-p
 """
-        file_path = NETWORKD_PATH / f"10-v-{vpn_name}-veth.netdev"
-        if self.dry_run:
-            logger.info(f"Would write netdev file: {file_path}")
-            return
-            
-        self.write_file_with_marker(file_path, content, vpn_name)
-    
-    def generate_veth_network_file(self, vpn: Dict) -> None:
-        """Generate veth network configuration file"""
-        vpn_name = vpn["name"]
-        veth_network = vpn["veth_network"]
-        ip_parts = veth_network.split('/')
-        network = ip_parts[0]
-        prefix = ip_parts[1] if len(ip_parts) > 1 else "30"
+        veth_netdev_path = NETWORKD_DIR / f"10-v-{vpn_name}-veth.netdev"
+        self._write_file(veth_netdev_path, veth_netdev_content)
         
-        # For a /30 network, .1 is the first usable address
-        veth_ip = network.rsplit('.', 1)[0] + ".1"
-        
-        content = f"""[Match]
+        # Create veth parent .network file
+        veth_parent_network_content = f"""[Match]
 Name=v-{vpn_name}-v
 
 [Network]
-Address={veth_ip}/{prefix}
-IPForward=yes
+Address={network_prefix}.{veth_network}.1/24
+ConfigureWithoutCarrier=yes
 """
-        file_path = NETWORKD_PATH / f"10-v-{vpn_name}-veth.network"
-        if self.dry_run:
-            logger.info(f"Would write network file: {file_path}")
-            return
-            
-        self.write_file_with_marker(file_path, content, vpn_name)
-    
-    def generate_wireguard_netdev_file(self, vpn: Dict) -> None:
-        """Generate WireGuard netdev configuration file"""
-        vpn_name = vpn["name"]
-        peer_public_key = vpn["peer_public_key"]
-        peer_endpoint = vpn["peer_endpoint"]
-        client_private_key = vpn["client_private_key"]
+        veth_parent_network_path = NETWORKD_DIR / f"10-v-{vpn_name}-veth.network"
+        self._write_file(veth_parent_network_path, veth_parent_network_content)
         
-        content = f"""[NetDev]
+        # Move peer device to namespace
+        if not self.dry_run:
+            logger.info(f"Setting up network namespace for {vpn_name}")
+            subprocess.run(["systemctl", "enable", "--now", f"vpn-ns-{vpn_name}.service"], check=True)
+            
+            # Wait for veth devices to appear
+            for _ in range(10):
+                result = subprocess.run(["ip", "link", "show", f"v-{vpn_name}-p"], 
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if result.returncode == 0:
+                    break
+                time.sleep(0.5)
+            
+            # Move peer to namespace
+            subprocess.run(["ip", "link", "set", f"v-{vpn_name}-p", "netns", f"ns-{vpn_name}"], check=True)
+        else:
+            logger.info(f"Would set up network namespace for {vpn_name}")
+            
+        # Create WireGuard .netdev file
+        wg_content = f"""[NetDev]
+Name=v-{vpn_name}-w
+Kind=wireguard
+
+[WireGuardPeer]
+PublicKey={vpn["wireguard"]["peer_public_key"]}
+Endpoint={vpn["wireguard"]["endpoint"]}
+AllowedIPs=0.0.0.0/0, ::/0
+PersistentKeepalive=25
+"""
+
+        # Add private key if provided
+        if "private_key" in vpn["wireguard"]:
+            wg_content = wg_content.replace("[NetDev]", f"""[NetDev]
 Name=v-{vpn_name}-w
 Kind=wireguard
 
 [WireGuard]
-PrivateKey={client_private_key}
-
-[WireGuardPeer]
-PublicKey={peer_public_key}
-Endpoint={peer_endpoint}
-AllowedIPs=0.0.0.0/0
-PersistentKeepalive=25
-"""
-        file_path = NETWORKD_PATH / f"20-v-{vpn_name}-wireguard.netdev"
-        if self.dry_run:
-            logger.info(f"Would write wireguard netdev file: {file_path}")
-            return
-            
-        self.write_file_with_marker(file_path, content, vpn_name)
-    
-    def generate_wireguard_network_file(self, vpn: Dict) -> None:
-        """Generate WireGuard network configuration file"""
-        vpn_name = vpn["name"]
-        vpn_assigned_ip = vpn["vpn_assigned_ip"]
+PrivateKey={vpn["wireguard"]["private_key"]}""")
         
-        content = f"""[Match]
+        wg_netdev_path = NETWORKD_DIR / f"20-v-{vpn_name}-wireguard.netdev"
+        self._write_file(wg_netdev_path, wg_content, mode=0o600)  # Restricted permissions for keys
+        
+        # Create WireGuard .network file
+        wg_network_content = f"""[Match]
 Name=v-{vpn_name}-w
 
 [Network]
-Address={vpn_assigned_ip}
-IPForward=yes
+Address={vpn["wireguard"]["client_ip"]}
+ConfigureWithoutCarrier=yes
 """
-        file_path = NETWORKD_PATH / f"20-v-{vpn_name}-wireguard.network"
-        if self.dry_run:
-            logger.info(f"Would write wireguard network file: {file_path}")
-            return
-            
-        self.write_file_with_marker(file_path, content, vpn_name)
-    
-    def generate_routing_table_file(self, vpn: Dict) -> None:
-        """Generate routing table configuration file"""
-        vpn_name = vpn["name"]
-        table_id = vpn["routing_table_id"]
-        table_name = vpn.get("routing_table_name", f"{vpn_name}vpn")
         
-        content = f"{table_id} {table_name}"
-        file_path = Path(f"/etc/iproute2/rt_tables.d/{vpn_name}_vpn.conf")
-        
-        if self.dry_run:
-            logger.info(f"Would write routing table file: {file_path}")
-            return
-            
-        try:
-            # Ensure parent directory exists
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Write the file with marker
-            self.write_file_with_marker(file_path, content, vpn_name)
-        except Exception as e:
-            logger.error(f"Failed to write routing table file {file_path}: {e}")
-    
-    def generate_client_routing_rules(self, vpn: Dict, client_index: int = 0) -> None:
-        """Generate routing rules for VPN clients"""
-        vpn_name = vpn["name"]
-        table_id = vpn["routing_table_id"]
-        
-        # Find clients assigned to this VPN
-        vpn_clients = [client for client in self.resolved_assignments 
-                       if client.get("assigned_vpn") == vpn_name]
-        
-        if not vpn_clients:
-            logger.info(f"No clients assigned to VPN {vpn_name}, skipping rules")
-            return
-            
-        # Generate rules for each client
-        for client_index, client in enumerate(vpn_clients):
-            client_ip = client["resolved_ip"]
-            client_name = client.get("display_name", client_ip.replace('.', '_'))
-            
-            # Sanitize client name for filename
-            safe_client_name = re.sub(r'[^a-zA-Z0-9_-]', '_', client_name)
-            
-            # Corrected: Use .network file with [RoutingPolicyRule] section
-            content = f"""[Match]
-Name=*
-
-[RoutingPolicyRule]
-From={client_ip}
-Table={table_id}
-Priority=100
-"""
-            # Corrected: Use .network extension instead of .rules
-            file_path = NETWORKD_PATH / f"50-{vpn_name}-client-{safe_client_name}.network"
-            
-            if self.dry_run:
-                logger.info(f"Would write client rule file: {file_path}")
-                continue
+        # Add DNS if provided
+        if "dns" in vpn["wireguard"]:
+            dns_servers = vpn["wireguard"]["dns"]
+            if isinstance(dns_servers, list):
+                for dns in dns_servers:
+                    wg_network_content += f"DNS={dns}\n"
+            else:
+                wg_network_content += f"DNS={dns_servers}\n"
                 
-            self.write_file_with_marker(file_path, content, vpn_name)
-    
-    def generate_vpn_service_file(self, vpn: Dict) -> None:
-        """Generate systemd service file for VPN namespace"""
-        vpn_name = vpn["name"]
-        table_id = vpn["routing_table_id"]
-        router_lan_interface = vpn.get("router_lan_interface", "eth0")
+        wg_network_path = NETWORKD_DIR / f"20-v-{vpn_name}-wireguard.network"
+        self._write_file(wg_network_path, wg_network_content)
         
-        content = f"""[Unit]
-Description=VPN Policy Router for {vpn_name}
-After=network.target systemd-networkd.service
+        # Create routing table entry
+        table_name = f"{vpn_name}_vpn"
+        rt_tables_path = Path("/etc/iproute2/rt_tables.d") / f"{vpn_name}_vpn.conf"
+        
+        # Ensure rt_tables.d directory exists
+        if not self.dry_run:
+            os.makedirs("/etc/iproute2/rt_tables.d", exist_ok=True)
+            
+        rt_tables_content = f"{routing_table_id} {table_name}\n"
+        self._write_file(rt_tables_path, rt_tables_content)
+        
+        # Create rules for peer interface inside namespace
+        if not self.dry_run:
+            logger.info(f"Configuring network inside namespace for {vpn_name}")
+            
+            # Configure IP in namespace
+            subprocess.run([
+                "ip", "netns", "exec", f"ns-{vpn_name}", 
+                "ip", "addr", "add", f"{network_prefix}.{veth_network}.2/24", 
+                "dev", f"v-{vpn_name}-p"
+            ], check=True)
+            
+            # Bring up interface in namespace
+            subprocess.run([
+                "ip", "netns", "exec", f"ns-{vpn_name}", 
+                "ip", "link", "set", "dev", f"v-{vpn_name}-p", "up"
+            ], check=True)
+            
+            # Add default route via veth in namespace
+            subprocess.run([
+                "ip", "netns", "exec", f"ns-{vpn_name}", 
+                "ip", "route", "add", "default", "via", f"{network_prefix}.{veth_network}.1"
+            ], check=True)
+        else:
+            logger.info(f"Would configure network inside namespace for {vpn_name}")
+            
+        # Create rules for routing
+        for rule in self._generate_routing_rules(vpn):
+            self._apply_routing_rule(rule)
+            
+        # Record created resources
+        self.created_resources.append({
+            "type": "namespace",
+            "name": f"ns-{vpn_name}",
+            "vpn_name": vpn_name
+        })
+        
+        self.created_resources.append({
+            "type": "interface",
+            "name": f"v-{vpn_name}-v",
+            "vpn_name": vpn_name
+        })
+        
+        self.created_resources.append({
+            "type": "interface",
+            "name": f"v-{vpn_name}-w",
+            "vpn_name": vpn_name
+        })
+        
+        self.created_resources.append({
+            "type": "routing_table",
+            "id": routing_table_id,
+            "name": table_name,
+            "vpn_name": vpn_name
+        })
+        
+        logger.info(f"Completed WireGuard configuration for {vpn_name}")
+        return True
+        
+    def _apply_openvpn_config(self, vpn):
+        """Apply OpenVPN configuration"""
+        vpn_name = vpn["name"]
+        veth_network = vpn["veth_network"]
+        routing_table_id = vpn["routing_table_id"]
+        network_prefix = self.vpn_definitions["system_config"]["veth_network_range"]["prefix"]
+        
+        logger.info(f"Applying OpenVPN configuration for {vpn_name}")
+        
+        # Create namespace service file
+        ns_service_content = f"""[Unit]
+Description=Network Namespace for VPN {vpn_name}
+After=network.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/bin/ip netns add ns-{vpn_name}
-ExecStart=/usr/bin/ip link set v-{vpn_name}-p netns ns-{vpn_name}
-ExecStart=/usr/bin/ip netns exec ns-{vpn_name} ip link set v-{vpn_name}-p up
-ExecStart=/usr/bin/ip netns exec ns-{vpn_name} ip link set lo up
-ExecStart=/usr/bin/ip netns exec ns-{vpn_name} ip link add v-{vpn_name}-w type wireguard
-ExecStart=/usr/bin/ip netns exec ns-{vpn_name} wg setconf v-{vpn_name}-w /etc/systemd/network/20-v-{vpn_name}-wireguard.conf
-ExecStart=/usr/bin/ip netns exec ns-{vpn_name} ip link set v-{vpn_name}-w up
-
-# Set up IP addresses and routing in the namespace
-ExecStart=/usr/bin/ip -n ns-{vpn_name} addr add {vpn["vpn_assigned_ip"]} dev v-{vpn_name}-w
-ExecStart=/usr/bin/ip -n ns-{vpn_name} addr add {vpn["veth_network"].split('/')[0].rsplit('.', 1)[0]}.2/30 dev v-{vpn_name}-p
-ExecStart=/usr/bin/ip -n ns-{vpn_name} route add default dev v-{vpn_name}-w
-
-# Set up NAT in the namespace
-ExecStart=/usr/bin/ip netns exec ns-{vpn_name} iptables -t nat -A POSTROUTING -o v-{vpn_name}-w -j MASQUERADE
-
-# Add the needed route in the main namespace for clients to reach the VPN
-ExecStart=/usr/bin/ip route add {vpn["veth_network"]} dev v-{vpn_name}-v
-ExecStart=/usr/bin/ip route add default via {vpn["veth_network"].split('/')[0].rsplit('.', 1)[0]}.2 table {table_id}
-
-# Configure masquerade for the return path
-ExecStart=/usr/bin/iptables -t nat -A POSTROUTING -o {router_lan_interface} -j MASQUERADE
-
-ExecStop=/usr/bin/ip route del default via {vpn["veth_network"].split('/')[0].rsplit('.', 1)[0]}.2 table {table_id} || true
-ExecStop=/usr/bin/ip route del {vpn["veth_network"]} || true
-ExecStop=/usr/bin/ip link del v-{vpn_name}-v || true
-ExecStop=/usr/bin/ip netns del ns-{vpn_name} || true
+ExecStop=/usr/bin/ip netns del ns-{vpn_name}
 
 [Install]
 WantedBy=multi-user.target
 """
-        file_path = Path(f"/etc/systemd/system/vpn-ns-{vpn_name}.service")
+        ns_service_path = SYSTEMD_DIR / f"vpn-ns-{vpn_name}.service"
+        self._write_file(ns_service_path, ns_service_content)
         
-        if self.dry_run:
-            logger.info(f"Would write service file: {file_path}")
-            return
+        # Create veth pair .netdev file
+        veth_netdev_content = f"""[NetDev]
+Name=v-{vpn_name}-v
+Kind=veth
+
+[Peer]
+Name=v-{vpn_name}-p
+"""
+        veth_netdev_path = NETWORKD_DIR / f"10-v-{vpn_name}-veth.netdev"
+        self._write_file(veth_netdev_path, veth_netdev_content)
+        
+        # Create veth parent .network file
+        veth_parent_network_content = f"""[Match]
+Name=v-{vpn_name}-v
+
+[Network]
+Address={network_prefix}.{veth_network}.1/24
+ConfigureWithoutCarrier=yes
+"""
+        veth_parent_network_path = NETWORKD_DIR / f"10-v-{vpn_name}-veth.network"
+        self._write_file(veth_parent_network_path, veth_parent_network_content)
+        
+        # Move peer device to namespace
+        if not self.dry_run:
+            logger.info(f"Setting up network namespace for {vpn_name}")
+            subprocess.run(["systemctl", "enable", "--now", f"vpn-ns-{vpn_name}.service"], check=True)
             
-        try:
-            # Write the file with marker
-            self.write_file_with_marker(file_path, content, vpn_name)
+            # Wait for veth devices to appear
+            for _ in range(10):
+                result = subprocess.run(["ip", "link", "show", f"v-{vpn_name}-p"], 
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if result.returncode == 0:
+                    break
+                time.sleep(0.5)
             
-            # Make sure permissions are correct
-            os.chmod(file_path, 0o644)
-        except Exception as e:
-            logger.error(f"Failed to write service file {file_path}: {e}")
-    
-    def setup_vpn(self, vpn: Dict) -> None:
-        """Set up a single VPN connection"""
+            # Move peer to namespace
+            subprocess.run(["ip", "link", "set", f"v-{vpn_name}-p", "netns", f"ns-{vpn_name}"], check=True)
+        else:
+            logger.info(f"Would set up network namespace for {vpn_name}")
+            
+        # Create routing table entry
+        table_name = f"{vpn_name}_vpn"
+        rt_tables_path = Path("/etc/iproute2/rt_tables.d") / f"{vpn_name}_vpn.conf"
+        
+        # Ensure rt_tables.d directory exists
+        if not self.dry_run:
+            os.makedirs("/etc/iproute2/rt_tables.d", exist_ok=True)
+            
+        rt_tables_content = f"{routing_table_id} {table_name}\n"
+        self._write_file(rt_tables_path, rt_tables_content)
+        
+        # Create rules for peer interface inside namespace
+        if not self.dry_run:
+            logger.info(f"Configuring network inside namespace for {vpn_name}")
+            
+            # Configure IP in namespace
+            subprocess.run([
+                "ip", "netns", "exec", f"ns-{vpn_name}", 
+                "ip", "addr", "add", f"{network_prefix}.{veth_network}.2/24", 
+                "dev", f"v-{vpn_name}-p"
+            ], check=True)
+            
+            # Bring up interface in namespace
+            subprocess.run([
+                "ip", "netns", "exec", f"ns-{vpn_name}", 
+                "ip", "link", "set", "dev", f"v-{vpn_name}-p", "up"
+            ], check=True)
+            
+            # Add default route via veth in namespace
+            subprocess.run([
+                "ip", "netns", "exec", f"ns-{vpn_name}", 
+                "ip", "route", "add", "default", "via", f"{network_prefix}.{veth_network}.1"
+            ], check=True)
+            
+            # Start OpenVPN in namespace (user must handle this separately)
+            logger.info(f"NOTE: You must start OpenVPN manually inside namespace 'ns-{vpn_name}'")
+            logger.info(f"Example: ip netns exec ns-{vpn_name} openvpn --config /path/to/config.ovpn")
+        else:
+            logger.info(f"Would configure network inside namespace for {vpn_name}")
+            logger.info(f"NOTE: You must start OpenVPN manually inside namespace 'ns-{vpn_name}'")
+            
+        # Create rules for routing
+        for rule in self._generate_routing_rules(vpn):
+            self._apply_routing_rule(rule)
+            
+        # Record created resources
+        self.created_resources.append({
+            "type": "namespace",
+            "name": f"ns-{vpn_name}",
+            "vpn_name": vpn_name
+        })
+        
+        self.created_resources.append({
+            "type": "interface",
+            "name": f"v-{vpn_name}-v",
+            "vpn_name": vpn_name
+        })
+        
+        self.created_resources.append({
+            "type": "routing_table",
+            "id": routing_table_id,
+            "name": table_name,
+            "vpn_name": vpn_name
+        })
+        
+        logger.info(f"Completed OpenVPN configuration for {vpn_name}")
+        return True
+        
+    def _generate_routing_rules(self, vpn):
+        """Generate routing rules for a VPN connection"""
         vpn_name = vpn["name"]
-        logger.info(f"Setting up VPN: {vpn_name}")
+        routing_table_id = vpn["routing_table_id"]
+        rules = []
         
-        if self.dry_run:
-            logger.info(f"=== DRY RUN MODE - Would set up VPN: {vpn_name} ===")
+        # Find all clients assigned to this VPN
+        assigned_clients = [a for a in self.vpn_clients["assignments"] if a["vpn"] == vpn_name]
         
-        # Generate configuration files
-        self.generate_veth_netdev_file(vpn)
-        self.generate_veth_network_file(vpn)
-        self.generate_wireguard_netdev_file(vpn)
-        self.generate_wireguard_network_file(vpn)
-        self.generate_routing_table_file(vpn)
-        self.generate_client_routing_rules(vpn)
-        self.generate_vpn_service_file(vpn)
-        
-        if self.dry_run:
-            return
+        # Add rules for each assigned client
+        for client in assigned_clients:
+            client_id = client["client_id"]
             
-        # Enable and start the service
+            # Validate client ID format
+            if not self._validate_client_id(client_id):
+                logger.warning(f"Invalid client ID format: {client_id}, skipping")
+                continue
+                
+            # Add routing rule
+            rule = {
+                "type": "from_client",
+                "client_id": client_id,
+                "routing_table_id": routing_table_id,
+                "vpn_name": vpn_name
+            }
+            rules.append(rule)
+            
+        return rules
+        
+    def _validate_client_id(self, client_id):
+        """Validate client ID format (IP address or MAC address)"""
+        # Check if it's a valid IP address
         try:
-            logger.info(f"Enabling and starting service: vpn-ns-{vpn_name}.service")
-            subprocess.run(["systemctl", "enable", f"vpn-ns-{vpn_name}.service"],
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            subprocess.run(["systemctl", "restart", f"vpn-ns-{vpn_name}.service"],
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except Exception as e:
-            logger.error(f"Error enabling/starting service vpn-ns-{vpn_name}.service: {e}")
-    
-    def check_for_modified_files(self) -> List[Dict]:
-        """Find files with our marker that have been modified using checksum verification"""
-        modified_files = []
+            ipaddress.ip_address(client_id)
+            return True
+        except ValueError:
+            pass
+            
+        # Check if it's a valid MAC address
+        if re.match(r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$', client_id):
+            return True
+            
+        return False
         
-        # Define our file patterns
-        file_patterns = [
-            "10-v-*.netdev",
-            "10-v-*.network",
-            "20-v-*.netdev",
-            "20-v-*.network",
-            "50-*-client-*.network"  # Changed from .rules to .network
-        ]
-        
-        # Look for our marker in files
-        marker_pattern = re.compile(r"# Generated by VPN-Router v1\.0\n"
-                                  r"# Associated VPN: ([a-zA-Z0-9_-]+)\n"
-                                  r"# Generated at: .+\n"
-                                  r"# Generated by: .+\n"  # Added user info
-                                  r"# Content-Hash: ([a-f0-9]+)\n"
-                                  r"# DO NOT EDIT: .+\n\n")
-        
-        for pattern in file_patterns:
-            for file_path in NETWORKD_PATH.glob(pattern):
-                try:
-                    # Read file content
-                    with open(file_path, 'r') as f:
-                        content = f.read()
+    def _apply_routing_rule(self, rule):
+        """Apply a routing rule"""
+        if rule["type"] == "from_client":
+            client_id = rule["client_id"]
+            routing_table_id = rule["routing_table_id"]
+            vpn_name = rule["vpn_name"]
+            
+            # Check if it's an IP or MAC
+            if re.match(r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$', client_id):
+                # MAC address - create a networkd rule file
+                rule_content = f"""[Match]
+MACAddress={client_id}
+
+[Network]
+IPForward=yes
+
+[RoutingPolicyRule]
+Table={routing_table_id}
+Priority=100
+"""
+                rule_path = NETWORKD_DIR / f"50-{vpn_name}-client-{client_id.replace(':', '-')}.network"
+                self._write_file(rule_path, rule_content)
+                
+                self.created_resources.append({
+                    "type": "networkd_rule",
+                    "path": str(rule_path),
+                    "vpn_name": vpn_name,
+                    "client_id": client_id
+                })
+            else:
+                # IP address - use ip rule
+                if not self.dry_run:
+                    try:
+                        # Delete any existing rules for this IP/table
+                        subprocess.run([
+                            "ip", "rule", "del", 
+                            "from", client_id, 
+                            "lookup", str(routing_table_id)
+                        ], stderr=subprocess.DEVNULL)
+                    except Exception:
+                        # Ignore errors if rule doesn't exist
+                        pass
+                        
+                    # Add the new rule
+                    subprocess.run([
+                        "ip", "rule", "add", 
+                        "from", client_id, 
+                        "lookup", str(routing_table_id),
+                        "prio", "100"
+                    ], check=True)
                     
-                    # Check if it has our marker
-                    match = marker_pattern.search(content)
-                    if match:
-                        vpn_name = match.group(1)
-                        stored_hash = match.group(2)
-                        
-                        # Extract the content part (everything after the marker)
-                        marker_end = match.end()
-                        file_content = content[marker_end:]
-                        
-                        # Calculate hash of the actual content
-                        actual_hash = hashlib.sha256(file_content.encode()).hexdigest()
-                        
-                        # Compare hashes
-                        if actual_hash != stored_hash:
-                            logger.warning(f"File {file_path} has been modified manually (hash mismatch)")
-                            modified_files.append({
-                                "path": str(file_path),
-                                "vpn_name": vpn_name,
-                                "expected_hash": stored_hash,
-                                "actual_hash": actual_hash
-                            })
-                except Exception as e:
-                    logger.warning(f"Error checking file {file_path}: {e}")
-        
-        return modified_files
-    
-    def handle_modified_files(self, modified_files: List[Dict]) -> None:
-        """Handle files that have been modified"""
-        if not modified_files:
-            return
-            
-        logger.warning(f"Found {len(modified_files)} files with manual modifications:")
-        for file in modified_files:
-            logger.warning(f"  - {file['path']} (VPN: {file['vpn_name']})")
-        
-        # Notify user about modified files
-        if not self.auto_mode:
-            print(f"\n{YELLOW}WARNING:{NC} {len(modified_files)} configuration files have been modified manually.")
-            print("These files will NOT be automatically updated or removed to preserve your changes.")
-            print("Please review these files manually:")
-            
-            for file in modified_files:
-                print(f"  - {file['path']}")
-                
-            print("\nYou may need to manually reconcile these files with the current configuration.")
-            print(f"To force overwrite of these files, run with {YELLOW}--force-overwrite{NC}")
-            
-        # If force_overwrite is enabled, regenerate these files
-        if self.force_overwrite:
-            logger.warning("Force overwrite enabled, overwriting modified files")
-            for file in modified_files:
-                file_path = Path(file['path'])
-                vpn_name = file['vpn_name']
-                
-                # Find the corresponding VPN configuration
-                vpn = None
-                for v in self.vpn_definitions["vpn_connections"]:
-                    if v["name"] == vpn_name:
-                        vpn = v
-                        break
-                        
-                if vpn:
-                    logger.info(f"Regenerating modified file: {file_path}")
-                    # Determine the type of file and regenerate it
-                    if "10-v" in file_path.name and "veth.netdev" in file_path.name:
-                        self.generate_veth_netdev_file(vpn)
-                    elif "10-v" in file_path.name and "veth.network" in file_path.name:
-                        self.generate_veth_network_file(vpn)
-                    elif "20-v" in file_path.name and "wireguard.netdev" in file_path.name:
-                        self.generate_wireguard_netdev_file(vpn)
-                    elif "20-v" in file_path.name and "wireguard.network" in file_path.name:
-                        self.generate_wireguard_network_file(vpn)
-                    elif "50-" in file_path.name and "client-" in file_path.name:
-                        self.generate_client_routing_rules(vpn)
+                    logger.info(f"Added routing rule: from {client_id} lookup {routing_table_id}")
                 else:
-                    logger.warning(f"Could not find VPN configuration for {vpn_name}, skipping regeneration")
+                    logger.info(f"Would add routing rule: from {client_id} lookup {routing_table_id}")
+                    
+                self.created_resources.append({
+                    "type": "ip_rule",
+                    "from": client_id,
+                    "table_id": routing_table_id,
+                    "vpn_name": vpn_name
+                })
+
+    def _is_managed_file(self, file_path):
+        """Check if a file is managed by vpn-router by examining metadata"""
+        try:
+            with open(file_path, 'r') as f:
+                content = f.read()
+                
+            # Check for our metadata header
+            if "# Generated by vpn-apply.py" in content and "# DO NOT EDIT - This file is managed by vpn-router" in content:
+                return True
+                
+            return False
+        except Exception:
+            return False
     
+    def _is_file_manually_modified(self, file_path):
+        """Check if a managed file was manually modified by comparing hash"""
+        try:
+            # Extract the stored hash from file metadata
+            stored_hash = self._extract_hash_from_file(file_path)
+            
+            if stored_hash:
+                # Read the file content
+                with open(file_path, 'r') as f:
+                    content = f.read()
+                
+                # Extract content without metadata
+                content_without_metadata = self._extract_content_without_metadata(content)
+                
+                # Calculate actual hash of content
+                actual_hash = self._calculate_content_hash(content_without_metadata)
+                
+                # If hashes don't match, file was modified
+                return stored_hash != actual_hash
+                
+            # If no hash found but file is managed, assume it's modified
+            return self._is_managed_file(file_path)
+        except Exception:
+            # If any error occurs, assume file was not modified
+            return False
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    def clean_orphaned_resources(self) -> Dict[str, int]:
+    def clean_orphaned_resources(self):
         """
         Clean up orphaned resources created by the VPN router system
         
@@ -806,6 +866,8 @@ WantedBy=multi-user.target
         
         # Get current active resources
         active_vpn_names = {vpn["name"] for vpn in self.vpn_definitions["vpn_connections"]}
+        
+        # Fix for the isdigit error - handle both string and int types for routing_table_id
         active_vpn_table_ids = set()
         for vpn in self.vpn_definitions["vpn_connections"]:
             if "routing_table_id" in vpn:
@@ -817,342 +879,352 @@ WantedBy=multi-user.target
                 else:
                     # If it's already an int or another numeric type
                     active_vpn_table_ids.add(int(table_id))
+        
         active_vpn_networks = {vpn["veth_network"] for vpn in self.vpn_definitions["vpn_connections"]
                              if "veth_network" in vpn}
         
-        # First check for modified files to avoid touching them
-        modified_files = self.check_for_modified_files()
-        modified_paths = {Path(file["path"]) for file in modified_files}
-        
-        # 1. Clean up orphaned network namespaces
-        logger.info("Cleaning up orphaned network namespaces...")
-        ns_list = subprocess.run(["ip", "netns", "list"], 
-                                capture_output=True, text=True).stdout
-        
-        for line in ns_list.splitlines():
-            if not line.strip():
-                continue
-                
-            # Extract namespace name (format is "ns-{vpn_name}")
-            ns_name = line.split(' ')[0].strip()
-            if ns_name.startswith("ns-"):
-                vpn_name = ns_name[3:]  # Remove "ns-" prefix
-                
-                if vpn_name not in active_vpn_names:
-                    logger.info(f"Cleaning up orphaned network namespace: {ns_name}")
-                    
-                    # Clean up any nftables rules in the namespace first
-                    subprocess.run(["ip", "netns", "exec", ns_name, "nft", "flush", "ruleset"],
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    
-                    # Delete the namespace
-                    result = subprocess.run(["ip", "netns", "del", ns_name],
-                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    
-                    if result.returncode == 0:
-                        logger.info(f"Successfully removed namespace: {ns_name}")
-                        cleaned["namespaces"] += 1
-                    else:
-                        logger.error(f"Failed to remove namespace {ns_name}: {result.stderr.decode()}")
-        
-        # 2. Clean up orphaned interfaces
-        logger.info("Cleaning up orphaned network interfaces...")
-        
-        # First by name pattern
-        if_list = subprocess.run(["ip", "link", "show"], 
-                                capture_output=True, text=True).stdout
-        
-        interface_pattern = re.compile(r"\d+:\s+(v-([a-zA-Z0-9_-]+)-[wvp])[@:]")
-        
-        for line in if_list.splitlines():
-            match = interface_pattern.search(line)
-            if match:
-                if_name = match.group(1)
-                vpn_name = match.group(2)
-                
-                if vpn_name not in active_vpn_names:
-                    logger.info(f"Cleaning up orphaned interface: {if_name}")
-                    result = subprocess.run(["ip", "link", "del", if_name],
-                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    
-                    if result.returncode == 0:
-                        logger.info(f"Successfully removed interface: {if_name}")
-                        cleaned["interfaces"] += 1
-                    else:
-                        logger.error(f"Failed to remove interface {if_name}: {result.stderr.decode()}")
-        
-        # Then by IP range
-        addr_output = subprocess.run(["ip", "addr", "show"], 
-                                   capture_output=True, text=True).stdout
-        
-        ip_pattern = re.compile(rf"inet ({self.veth_network_prefix}\.\d+\.\d+)/\d+.+\s(\S+)$", re.MULTILINE)
-        
-        for match in ip_pattern.finditer(addr_output):
-            ip_addr = match.group(1)
-            interface = match.group(2)
-            
-            # Skip interfaces that match our naming pattern (already handled above)
-            if re.match(r"v-[a-zA-Z0-9_-]+-[wvp]", interface):
-                continue
-                
-            network_prefix = ip_addr[:ip_addr.rindex(".")] + ".0"  # Convert IP to network prefix
-            
-            # Check if this network is part of any active VPN
-            network_active = False
-            for network in active_vpn_networks:
-                if network_prefix in network:
-                    network_active = True
-                    break
-                    
-            if not network_active:
-                logger.info(f"Cleaning up orphaned interface by IP: {interface} ({ip_addr})")
-                result = subprocess.run(["ip", "link", "del", interface],
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                
-                if result.returncode == 0:
-                    logger.info(f"Successfully removed interface: {interface}")
-                    cleaned["interfaces"] += 1
-                else:
-                    logger.error(f"Failed to remove interface {interface}: {result.stderr.decode()}")
-        
-        # 3. Clean up orphaned routing tables and rules
-        logger.info("Cleaning up orphaned routing tables and rules...")
-        
-        # Clean up routing rules first
-        rules_list = subprocess.run(["ip", "rule", "list"], 
-                                  capture_output=True, text=True).stdout
-        
-        for line in rules_list.splitlines():
-            if "lookup" in line:
-                parts = line.split("lookup")
-                if len(parts) >= 2:
-                    table_ref = parts[1].strip()
-                    
-                    if table_ref.isdigit():
-                        table_id = int(table_ref)
-                        
-                        if (self.routing_table_id_min <= table_id <= self.routing_table_id_max and 
-                            table_id not in active_vpn_table_ids):
-                            
-                            # Extract priority and from clause
-                            priority_match = re.search(r"^(\d+):", line)
-                            if priority_match:
-                                priority = priority_match.group(1)
-                                
-                                from_match = re.search(r"from\s+([0-9./]+)", line)
-                                from_clause = ""
-                                if from_match:
-                                    from_clause = f"from {from_match.group(1)}"
-                                    
-                                # Delete the rule
-                                cmd = ["ip", "rule", "del", "priority", priority]
-                                if from_clause:
-                                    cmd.extend(from_clause.split())
-                                    
-                                logger.info(f"Cleaning up orphaned routing rule: {line.strip()}")
-                                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                                
-                                if result.returncode == 0:
-                                    logger.info(f"Successfully removed routing rule")
-                                    cleaned["routing_rules"] += 1
-                                else:
-                                    logger.error(f"Failed to remove routing rule: {result.stderr.decode()}")
+        # Define routing table range
+        min_table_id = self.vpn_definitions["system_config"]["routing_table_id_range"]["min"]
+        max_table_id = self.vpn_definitions["system_config"]["routing_table_id_range"]["max"]
+        network_prefix = self.vpn_definitions["system_config"]["veth_network_range"]["prefix"]
         
         # Clean up routing tables in rt_tables.d
-        rt_tables_d_path = Path("/etc/iproute2/rt_tables.d/")
+        rt_tables_d_path = Path("/etc/iproute2/rt_tables.d")
         if rt_tables_d_path.exists():
+            logger.info("Checking for orphaned routing tables in rt_tables.d...")
+            
+            # First, scan all rt_tables.d files to identify orphaned tables
+            orphaned_files = []
+            orphaned_tables = []
+            
             for file_path in rt_tables_d_path.glob("*.conf"):
                 try:
+                    # Check if this is a managed file
+                    is_managed = self._is_managed_file(file_path)
+                    
+                    # Check if the file was manually modified
+                    is_modified = is_managed and self._is_file_manually_modified(file_path)
+                    
                     with open(file_path, 'r') as f:
                         content = f.read()
-                        
-                    # Check for our marker
-                    marker_match = re.search(r"# Generated by VPN-Router v1\.0\n# Associated VPN: ([a-zA-Z0-9_-]+)", content)
-                    if marker_match:
-                        vpn_name = marker_match.group(1)
-                        if vpn_name not in active_vpn_names:
-                            logger.info(f"Removing orphaned routing table file with marker: {file_path}")
-                            file_path.unlink(missing_ok=True)
-                            cleaned["routing_tables"] += 1
-                            continue
                     
-                    # If no marker, check by table ID
-                    rt_pattern = re.compile(r"^(\d+)\s+(.+)$", re.MULTILINE)
-                    match = rt_pattern.search(content)
-                    if match and match.group(1).isdigit():
+                    # Extract table ID and name from the actual content (after metadata if present)
+                    content_without_metadata = self._extract_content_without_metadata(content) if is_managed else content
+                    
+                    match = re.match(r"^\s*(\d+)\s+(\S+)", content_without_metadata.strip())
+                    if match:
                         table_id = int(match.group(1))
+                        table_name = match.group(2)
                         
-                        if (self.routing_table_id_min <= table_id <= self.routing_table_id_max and 
-                            table_id not in active_vpn_table_ids):
+                        # Check if it's in our range and not currently active
+                        if ((min_table_id <= table_id <= max_table_id and table_id not in active_vpn_table_ids) or 
+                            (is_managed and table_id not in active_vpn_table_ids)):
                             
-                            logger.info(f"Removing orphaned routing table file by ID: {file_path}")
-                            file_path.unlink(missing_ok=True)
-                            cleaned["routing_tables"] += 1
+                            # If file name contains a VPN name, check if it's active
+                            file_name = file_path.name
+                            vpn_related = False
+                            
+                            if "_" in file_name:
+                                possible_vpn_name = file_name.split("_")[0]
+                                if possible_vpn_name not in active_vpn_names:
+                                    vpn_related = True
+                            
+                            # Only delete managed files that haven't been modified, or files with VPN-related names
+                            if (is_managed and not is_modified) or vpn_related:
+                                orphaned_tables.append((table_id, table_name))
+                                orphaned_files.append((file_path, vpn_related, is_managed, is_modified))
+                                logger.info(f"Found orphaned routing table: {table_id} ({table_name}) in {file_path}")
+                            else:
+                                logger.warning(f"Skipping modified file or non-managed file: {file_path}")
                 except Exception as e:
-                    logger.warning(f"Error processing routing table file {file_path}: {e}")
+                    logger.error(f"Error processing routing table file {file_path}: {e}")
+            
+            # Now remove the orphaned files
+            for file_path, vpn_related, is_managed, is_modified in orphaned_files:
+                if (is_managed and not is_modified) or vpn_related:
+                    try:
+                        logger.info(f"Removing orphaned routing table file: {file_path}")
+                        os.remove(file_path)
+                        cleaned["routing_tables"] += 1
+                    except Exception as e:
+                        logger.error(f"Failed to remove routing table file {file_path}: {e}")
+                else:
+                    logger.warning(f"Skipping modified or non-managed file: {file_path}")
         
-        # Update main routing tables file if needed
+        # Clean up routing tables in main rt_tables file
         rt_tables_path = Path("/etc/iproute2/rt_tables")
         if rt_tables_path.exists():
             try:
+                logger.info("Checking for orphaned routing tables in main rt_tables file...")
+                
                 with open(rt_tables_path, 'r') as f:
-                    rt_tables_content = f.read()
+                    lines = f.readlines()
+                
+                new_lines = []
+                modified = False
+                
+                for line in lines:
+                    if line.strip() and not line.strip().startswith("#"):
+                        match = re.match(r"^\s*(\d+)\s+(\S+)", line)
+                        if match:
+                            table_id = int(match.group(1))
+                            table_name = match.group(2)
+                            
+                            if (min_table_id <= table_id <= max_table_id and 
+                                table_id not in active_vpn_table_ids):
+                                
+                                logger.info(f"Removing orphaned routing table from main rt_tables: {table_id} ({table_name})")
+                                modified = True
+                                cleaned["routing_tables"] += 1
+                                continue
                     
-                rt_pattern = re.compile(r"^(\d+)\s+(.+)$", re.MULTILINE)
-                matches = rt_pattern.findall(rt_tables_content)
+                    new_lines.append(line)
                 
-                new_content = []
-                removed_entries = 0
-                
-                for line in rt_tables_content.splitlines():
-                    match = rt_pattern.match(line)
-                    if match and match.group(1).isdigit():
-                        table_id = int(match.group(1))
-                        
-                        if (self.routing_table_id_min <= table_id <= self.routing_table_id_max and 
-                            table_id not in active_vpn_table_ids):
-                            # Skip this line (remove entry)
-                            removed_entries += 1
-                            continue
-                    
-                    new_content.append(line)
-                
-                # Write back the file if it changed
-                if removed_entries > 0:
+                if modified:
                     with open(rt_tables_path, 'w') as f:
-                        f.write("\n".join(new_content) + "\n")
-                    logger.info(f"Updated main routing tables file, removed {removed_entries} orphaned entries")
-                    cleaned["routing_tables"] += removed_entries
+                        f.writelines(new_lines)
             except Exception as e:
-                logger.error(f"Error updating routing tables file: {e}")
+                logger.error(f"Error cleaning main rt_tables file: {e}")
         
-        # 4. Clean up systemd services
-        logger.info("Cleaning up orphaned systemd services...")
-        
-        # Look for service files matching our pattern
-        for service_path in Path("/etc/systemd/system").glob("vpn-ns-*.service"):
-            vpn_name = service_path.name.split("vpn-ns-")[1].split(".")[0]
+        # Clean up routing rules
+        try:
+            logger.info("Checking for orphaned routing rules...")
+            rules_output = subprocess.run(["ip", "rule", "list"], 
+                                        capture_output=True, text=True).stdout
             
-            if vpn_name not in active_vpn_names:
-                service_name = service_path.name
-                logger.info(f"Found orphaned service: {service_name}")
-                
-                # Stop and disable the service
-                subprocess.run(["systemctl", "stop", service_name],
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                subprocess.run(["systemctl", "disable", service_name],
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                
-                # Check if file has our marker
-                try:
-                    with open(service_path, 'r') as f:
-                        content = f.read()
+            for line in rules_output.splitlines():
+                if "lookup" in line:
+                    parts = line.split("lookup")
+                    if len(parts) >= 2:
+                        table_ref = parts[1].strip()
                         
-                    marker_match = re.search(r"# Generated by VPN-Router v1\.0\n# Associated VPN: ([a-zA-Z0-9_-]+)", content)
-                    if not marker_match or marker_match.group(1) == vpn_name:
-                        # Remove the service file if it has our marker or no marker but matches our naming pattern
-                        logger.info(f"Removing orphaned service file: {service_path}")
-                        service_path.unlink(missing_ok=True)
-                        cleaned["services"] += 1
+                        if table_ref.isdigit():
+                            table_id = int(table_ref)
+                            
+                            if (min_table_id <= table_id <= max_table_id and 
+                                table_id not in active_vpn_table_ids):
+                                
+                                # Extract from clause if exists
+                                from_match = re.search(r"from\s+([0-9./]+)", line)
+                                from_ip = from_match.group(1) if from_match else None
+                                
+                                # Extract priority
+                                priority_match = re.search(r"^(\d+):", line)
+                                priority = priority_match.group(1) if priority_match else None
+                                
+                                cmd = ["ip", "rule", "del"]
+                                
+                                if from_ip:
+                                    cmd.extend(["from", from_ip])
+                                    
+                                cmd.extend(["lookup", str(table_id)])
+                                
+                                if priority:
+                                    cmd.extend(["prio", priority])
+                                
+                                logger.info(f"Removing orphaned routing rule: {' '.join(cmd)}")
+                                
+                                try:
+                                    subprocess.run(cmd, check=True)
+                                    cleaned["routing_rules"] += 1
+                                except subprocess.CalledProcessError as e:
+                                    logger.error(f"Failed to remove routing rule: {e}")
+        except Exception as e:
+            logger.error(f"Error cleaning routing rules: {e}")
+        
+        # Clean up networkd files
+        try:
+            logger.info("Checking for orphaned networkd files...")
+            
+            # Patterns for VPN related files
+            patterns = ["10-v-*-*.netdev", "10-v-*-*.network", "20-v-*-*.netdev", "20-v-*-*.network", "50-*-client-*.network"]
+            
+            for pattern in patterns:
+                for file_path in NETWORKD_DIR.glob(pattern):
+                    # First check if this is a managed file
+                    is_managed = self._is_managed_file(file_path)
+                    
+                    # Check if the file was manually modified
+                    is_modified = is_managed and self._is_file_manually_modified(file_path)
+                    
+                    # Extract VPN name
+                    if "-v-" in file_path.name:
+                        # Format v-{vpn_name}-* for veth and wireguard devices
+                        name_parts = file_path.name.split("-v-")
+                        if len(name_parts) > 1:
+                            vpn_parts = name_parts[1].split("-", 1)
+                            if len(vpn_parts) > 0:
+                                vpn_name = vpn_parts[0]
+                                
+                                if vpn_name not in active_vpn_names:
+                                    # Only delete managed files that haven't been modified, or files with VPN-related names
+                                    if (is_managed and not is_modified) or vpn_name:
+                                        logger.info(f"Removing orphaned networkd file: {file_path}")
+                                        try:
+                                            os.remove(file_path)
+                                            cleaned["files"] += 1
+                                        except Exception as e:
+                                            logger.error(f"Failed to remove file {file_path}: {e}")
+                                    else:
+                                        logger.warning(f"Skipping modified or non-managed file: {file_path}")
+                    elif "client-" in file_path.name:
+                        # Format 50-{vpn_name}-client-*
+                        name_parts = file_path.name.split("-client-")
+                        if len(name_parts) > 0:
+                            vpn_parts = name_parts[0].split("-", 1)
+                            if len(vpn_parts) > 1:
+                                vpn_name = vpn_parts[1]
+                                
+                                if vpn_name not in active_vpn_names:
+                                    # Only delete managed files that haven't been modified, or files with VPN-related names
+                                    if (is_managed and not is_modified) or vpn_name:
+                                        logger.info(f"Removing orphaned client rule file: {file_path}")
+                                        try:
+                                            os.remove(file_path)
+                                            cleaned["files"] += 1
+                                        except Exception as e:
+                                            logger.error(f"Failed to remove file {file_path}: {e}")
+                                    else:
+                                        logger.warning(f"Skipping modified or non-managed file: {file_path}")
+        except Exception as e:
+            logger.error(f"Error cleaning networkd files: {e}")
+        
+        # Clean up systemd service files
+        try:
+            logger.info("Checking for orphaned systemd service files...")
+            
+            for service_path in SYSTEMD_DIR.glob("vpn-ns-*.service"):
+                # Check if this is a managed file
+                is_managed = self._is_managed_file(service_path)
+                
+                # Check if the file was manually modified
+                is_modified = is_managed and self._is_file_manually_modified(service_path)
+                
+                vpn_name = service_path.name.split("vpn-ns-")[1].split(".")[0]
+                
+                if vpn_name not in active_vpn_names:
+                    # Only delete managed files that haven't been modified, or files with VPN-related names
+                    if (is_managed and not is_modified) or vpn_name:
+                        logger.info(f"Disabling and removing orphaned service: {service_path}")
+                        try:
+                            # Disable and stop the service
+                            subprocess.run(["systemctl", "disable", "--now", service_path.name], 
+                                         stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+                            
+                            # Remove the service file
+                            os.remove(service_path)
+                            cleaned["services"] += 1
+                        except Exception as e:
+                            logger.error(f"Failed to remove service {service_path}: {e}")
                     else:
-                        logger.warning(f"Service file {service_path} has marker for different VPN, leaving intact")
-                except Exception as e:
-                    logger.error(f"Error checking service file {service_path}: {e}")
+                        logger.warning(f"Skipping modified or non-managed service file: {service_path}")
+        except Exception as e:
+            logger.error(f"Error cleaning systemd services: {e}")
         
-        # Run daemon-reload if any services were removed
-        if cleaned["services"] > 0:
-            logger.info("Running systemctl daemon-reload after removing service files")
-            subprocess.run(["systemctl", "daemon-reload"],
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        
-        # 5. Clean up orphaned config files
-        logger.info("Cleaning up orphaned configuration files...")
-        
-        # Find orphaned config files (files with our marker for inactive VPNs)
-        for pattern in ["10-v-*.netdev", "10-v-*.network", "20-v-*.netdev", "20-v-*.network", "50-*-client-*.network"]:  # Changed from .rules to .network
-            for file_path in NETWORKD_PATH.glob(pattern):
-                # Skip if it's in the modified files list
-                if file_path in modified_paths:
-                    logger.info(f"Skipping modified file: {file_path}")
+        # Clean up network namespaces
+        try:
+            logger.info("Checking for orphaned network namespaces...")
+            
+            ns_output = subprocess.run(["ip", "netns", "list"], 
+                                     capture_output=True, text=True).stdout
+            
+            for line in ns_output.splitlines():
+                if not line.strip():
                     continue
                     
-                try:
-                    # Read file to check for our marker
-                    with open(file_path, 'r') as f:
-                        content = f.read()
-                        
-                    # Check if it has our marker and extract VPN name
-                    marker_match = re.search(r"# Generated by VPN-Router v1\.0\n# Associated VPN: ([a-zA-Z0-9_-]+)", content)
-                    if marker_match:
-                        vpn_name = marker_match.group(1)
-                        
-                        # If VPN is not active, file is orphaned
-                        if vpn_name not in active_vpn_names:
-                            logger.info(f"Removing orphaned file: {file_path}")
-                            file_path.unlink(missing_ok=True)
-                            cleaned["files"] += 1
-                except Exception as e:
-                    logger.warning(f"Error checking file {file_path}: {e}")
+                # Extract namespace name
+                ns_name = line.split(' ')[0].strip()
+                
+                # Check if it matches our pattern
+                if ns_name.startswith("ns-"):
+                    vpn_name = ns_name[3:]  # Remove "ns-" prefix
+                    
+                    # Check if VPN is active
+                    if vpn_name not in active_vpn_names:
+                        logger.info(f"Removing orphaned namespace: {ns_name}")
+                        try:
+                            subprocess.run(["ip", "netns", "del", ns_name], check=True)
+                            cleaned["namespaces"] += 1
+                        except subprocess.CalledProcessError as e:
+                            logger.error(f"Failed to remove namespace {ns_name}: {e}")
+        except Exception as e:
+            logger.error(f"Error cleaning network namespaces: {e}")
         
-        # If any networkd files were changed, reload networkd
-        if cleaned["files"] > 0:
-            logger.info("Reloading networkd after removing configuration files")
-            subprocess.run(["networkctl", "reload"],
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        
-        # Handle modified files last (just notification, no changes)
-        self.handle_modified_files(modified_files)
-        
-        # Log cleanup summary
-        total_cleaned = sum(cleaned.values())
-        if total_cleaned > 0:
-            logger.info(f"Cleanup completed: {total_cleaned} orphaned resources removed")
-            for resource_type, count in cleaned.items():
-                if count > 0:
-                    logger.info(f"  - {resource_type}: {count}")
-        else:
-            logger.info("No orphaned resources found to clean up")
+        # Clean up network interfaces
+        try:
+            logger.info("Checking for orphaned network interfaces...")
             
+            # Look for interfaces with our naming pattern
+            if_pattern = re.compile(r"\d+:\s+(v-([a-zA-Z0-9_-]+)-[wvp])[@:]")
+            if_output = subprocess.run(["ip", "link", "show"], 
+                                     capture_output=True, text=True).stdout
+            
+            for line in if_output.splitlines():
+                match = if_pattern.search(line)
+                if match:
+                    if_name = match.group(1)
+                    vpn_name = match.group(2)
+                    
+                    # Check if VPN is active
+                    if vpn_name not in active_vpn_names:
+                        logger.info(f"Removing orphaned interface: {if_name}")
+                        try:
+                            subprocess.run(["ip", "link", "del", if_name], check=True)
+                            cleaned["interfaces"] += 1
+                        except subprocess.CalledProcessError as e:
+                            logger.error(f"Failed to remove interface {if_name}: {e}")
+        except Exception as e:
+            logger.error(f"Error cleaning network interfaces: {e}")
+        
+        logger.info(f"Cleaned up resources: {cleaned}")
         return cleaned
-    
-    def apply_configuration(self) -> None:
-        """Apply the configuration to the system"""
-        # Load and validate configuration
-        if not self.load_configuration():
-            logger.error("Failed to load configuration files")
-            sys.exit(1)
+
+    def apply_configuration(self):
+        """Apply the VPN router configuration"""
+        if self.dry_run:
+            logger.info("=== DRY RUN MODE - No changes will be applied ===")
             
-        if not self.validate_configuration():
-            logger.error("Configuration validation failed")
-            sys.exit(1)
-        
-        # If clean_orphaned is specified, only clean orphaned resources
+        # Check if we need to clean orphaned resources first
         if self.clean_orphaned:
-            logger.info("Running orphaned resource cleanup...")
-            self.identify_active_and_removed_vpns()
+            logger.info("Cleaning up orphaned resources...")
             self.clean_orphaned_resources()
-            return
             
-        # Prepare client assignments
-        self.resolve_hostname_assignments()
+        logger.info("Applying VPN router configuration...")
         
-        # Identify which VPNs are active and which should be removed
-        self.identify_active_and_removed_vpns()
+        # Reset tracking variables
+        self.changed_files = []
+        self.created_resources = []
         
-        # Clean up removed VPNs
-        self.cleanup_removed_vpns()
-        
-        # Set up each active VPN
+        # Apply each VPN configuration
         for vpn in self.vpn_definitions["vpn_connections"]:
-            self.setup_vpn(vpn)
+            if vpn["type"] == "wireguard":
+                self._apply_wireguard_config(vpn)
+            elif vpn["type"] == "openvpn":
+                self._apply_openvpn_config(vpn)
+                
+        # Restart systemd-networkd if needed and not in dry run
+        if self.changed_files and not self.dry_run:
+            # Check if any network or netdev files were changed
+            network_files_changed = any(
+                f.endswith(".network") or f.endswith(".netdev") 
+                for f in self.changed_files
+            )
             
-        # Reload networkd
-        if not self.dry_run:
-            logger.info("Reloading networkd")
-            subprocess.run(["networkctl", "reload"],
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if network_files_changed:
+                logger.info("Network configuration files changed, restarting systemd-networkd...")
+                self._restart_systemd_networkd()
+                
+        if self.dry_run:
+            logger.info("=== DRY RUN COMPLETED - No changes were applied ===")
+        else:
+            logger.info("VPN router configuration applied successfully")
             
-        logger.info("VPN Policy Router configuration applied successfully")
+        # Return summary of changes
+        return {
+            "dry_run": self.dry_run,
+            "changed_files": self.changed_files,
+            "created_resources": self.created_resources
+        }
 
 
 def main():
@@ -1183,6 +1255,7 @@ def main():
     )
     
     router.apply_configuration()
+
 
 if __name__ == "__main__":
     main()
