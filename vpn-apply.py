@@ -806,17 +806,17 @@ WantedBy=multi-user.target
         
         # Get current active resources
         active_vpn_names = {vpn["name"] for vpn in self.vpn_definitions["vpn_connections"]}
-		    active_vpn_table_ids = set()
-		    for vpn in self.vpn_definitions["vpn_connections"]:
-		        if "routing_table_id" in vpn:
-		            table_id = vpn["routing_table_id"]
-		            # Convert to int if it's a string and can be converted
-		            if isinstance(table_id, str):
-		                if table_id.isdigit():
-		                    active_vpn_table_ids.add(int(table_id))
-		            else:
-		                # If it's already an int or another numeric type
-		                active_vpn_table_ids.add(int(table_id))
+        active_vpn_table_ids = set()
+        for vpn in self.vpn_definitions["vpn_connections"]:
+            if "routing_table_id" in vpn:
+                table_id = vpn["routing_table_id"]
+                # Convert to int if it's a string and can be converted
+                if isinstance(table_id, str):
+                    if table_id.isdigit():
+                        active_vpn_table_ids.add(int(table_id))
+                else:
+                    # If it's already an int or another numeric type
+                    active_vpn_table_ids.add(int(table_id))
         active_vpn_networks = {vpn["veth_network"] for vpn in self.vpn_definitions["vpn_connections"]
                              if "veth_network" in vpn}
         
