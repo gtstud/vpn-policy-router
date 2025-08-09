@@ -1,148 +1,231 @@
 #!/bin/bash
-# VPN Policy Router Installation Script
-# Date: 2025-08-09 18:13:44
+#
+# VPN Router Installation Script
+#
+# This script installs and configures the VPN Router system.
+#
+# Created by: gtstud1
+# Date: 2025-08-09 20:40:39
 
 set -e
 
-# Color codes for prettier output
-RED='\033[0;31m'
+# Constants
+CONFIG_DIR="/etc/vpn-router"
+SCRIPT_DIR="/usr/local/bin"
+SYSTEMD_DIR="/etc/systemd/system"
+CURRENT_USER="gtstud1"
+CURRENT_TIMESTAMP="2025-08-09 20:40:39"
+
+# ANSI colors for terminal output
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+RED='\033[0;31m'
+NC='\033[0m'  # No Color
 
-# Print with timestamp
+# Logging function
 log() {
-    echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1"
-}
-
-error() {
-    echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] ERROR:${NC} $1"
+    echo -e "${GREEN}[INFO]${NC} $1"
 }
 
 warning() {
-    echo -e "${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')] WARNING:${NC} $1"
+    echo -e "${YELLOW}[WARNING]${NC} $1"
 }
 
-success() {
-    echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS:${NC} $1"
+error() {
+    echo -e "${RED}[ERROR]${NC} $1"
 }
 
 # Check if script is run as root
-if [[ $EUID -ne 0 ]]; then
-   error "This script must be run as root"
-   exit 1
+if [ "$(id -u)" -ne 0 ]; then
+    error "This script must be run as root"
+    exit 1
 fi
 
-# Define directories
-INSTALL_DIR="/opt/vpn-router"
-CONFIG_DIR="/etc/vpn-router"
-SYSTEMD_DIR="/etc/systemd/system"
-
-# Create directories
-log "Creating installation directories..."
-mkdir -p ${INSTALL_DIR}
-mkdir -p ${CONFIG_DIR}
-
-# Install dependencies
-log "Installing required packages..."
-if [ -f /etc/debian_version ]; then
-    # Debian/Ubuntu
-    apt-get update
-    apt-get install -y python3 python3-pip wireguard iproute2 nftables
-elif [ -f /etc/redhat-release ]; then
-    # RHEL/CentOS
-    yum install -y python3 python3-pip wireguard iproute2 nftables
-elif [ -f /etc/arch-release ]; then
-    # Arch Linux
-    pacman -Sy python python-pip wireguard-tools iproute2 nftables
-else
-    warning "Unsupported distribution, please install Python 3, WireGuard, iproute2 and nftables manually"
-fi
-
-# Copy main script
-log "Copying VPN router script..."
-cp vpn-apply.py ${INSTALL_DIR}/
-chmod +x ${INSTALL_DIR}/vpn-apply.py
-
-# Copy systemd service file
-log "Setting up systemd service..."
-cp vpn-router.service ${SYSTEMD_DIR}/
-
-# Handle configuration files - don't overwrite existing ones
-log "Setting up configuration files..."
-
-# VPN definitions
-if [ -f "${CONFIG_DIR}/vpn-definitions.json" ]; then
-    warning "Existing vpn-definitions.json found. Not overwriting."
-    # Copy example as reference with timestamp
-    cp example-configs/vpn-definitions.json "${CONFIG_DIR}/vpn-definitions.json.example-$(date +%Y%m%d%H%M%S)"
-    success "Saved example vpn-definitions.json as reference"
-else
-    cp example-configs/vpn-definitions.json ${CONFIG_DIR}/
-    success "Installed default vpn-definitions.json"
-    warning "Please update vpn-definitions.json with your VPN connection details"
-fi
-
-# Client assignments
-if [ -f "${CONFIG_DIR}/vpn-clients.json" ]; then
-    warning "Existing vpn-clients.json found. Not overwriting."
-    # Copy example as reference with timestamp
-    cp example-configs/vpn-clients.json "${CONFIG_DIR}/vpn-clients.json.example-$(date +%Y%m%d%H%M%S)"
-    success "Saved example vpn-clients.json as reference"
-else
-    cp example-configs/vpn-clients.json ${CONFIG_DIR}/
-    success "Installed default vpn-clients.json"
-    warning "Please update vpn-clients.json with your client assignments"
-fi
-
-# Set appropriate permissions
-log "Setting permissions..."
-chown -R root:root ${INSTALL_DIR}
-chmod -R 755 ${INSTALL_DIR}
-chown -R root:root ${CONFIG_DIR}
-chmod -R 600 ${CONFIG_DIR}/*.json
-chmod 700 ${CONFIG_DIR}
-
-# Enable systemd service
-log "Enabling systemd service..."
-systemctl daemon-reload
-systemctl enable vpn-router.service
-
-# Create directories for routing tables
-log "Setting up routing table directory..."
-mkdir -p /etc/iproute2/rt_tables.d/
-
-log "Installation completed!"
-log "------------------------------------"
-log "Next steps:"
-log "1. Edit ${CONFIG_DIR}/vpn-definitions.json with your VPN connection details"
-log "2. Edit ${CONFIG_DIR}/vpn-clients.json with your client assignments"
-log "3. Run 'systemctl start vpn-router' to apply the configuration"
-log "4. Check status with 'systemctl status vpn-router'"
-log "------------------------------------"
-
-# Offer to validate configuration
-read -p "Would you like to validate your configuration now? (y/n): " validate
-if [[ $validate == "y" || $validate == "Y" ]]; then
-    log "Validating configuration..."
-    ${INSTALL_DIR}/vpn-apply.py --validate
-    if [ $? -eq 0 ]; then
-        success "Configuration validation successful!"
-        
-        read -p "Would you like to start the VPN router service now? (y/n): " start_service
-        if [[ $start_service == "y" || $start_service == "Y" ]]; then
-            log "Starting VPN router service..."
-            systemctl start vpn-router.service
-            systemctl status vpn-router.service
-        else
-            log "You can start the service later with 'systemctl start vpn-router'"
+# Check for required commands
+check_requirements() {
+    log "Checking system requirements..."
+    
+    REQUIRED_COMMANDS=("ip" "wg" "getent" "systemctl" "networkctl" "python3" "iptables")
+    
+    for cmd in "${REQUIRED_COMMANDS[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            error "Required command not found: $cmd"
+            error "Please install the necessary packages and try again."
+            exit 1
         fi
-    else
-        error "Configuration validation failed. Please check your configuration files."
+    done
+    
+    # Check Python version (3.6+ required)
+    PYTHON_VERSION=$(python3 --version | cut -d ' ' -f 2)
+    PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d '.' -f 1)
+    PYTHON_MINOR=$(echo "$PYTHON_VERSION" | cut -d '.' -f 2)
+    
+    if [ "$PYTHON_MAJOR" -lt 3 ] || ([ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -lt 6 ]); then
+        error "Python 3.6+ is required (found $PYTHON_VERSION)"
+        exit 1
     fi
-else
-    log "You can validate your configuration later with '${INSTALL_DIR}/vpn-apply.py --validate'"
-fi
+    
+    log "All requirements satisfied"
+}
 
-success "VPN Policy Router installation complete!"
+# Check for conflicts with existing system configuration
+check_for_conflicts() {
+    log "Checking for conflicts with existing system configuration..."
+    
+    # Extract ranges from config if it exists
+    if [ -f "${CONFIG_DIR}/vpn-definitions.json" ]; then
+        # Use grep and sed to extract ranges (since jq might not be installed)
+        MIN_TABLE_ID=$(grep -o '"min": *[0-9]*' "${CONFIG_DIR}/vpn-definitions.json" | sed 's/.*: *//' || echo "7001")
+        MAX_TABLE_ID=$(grep -o '"max": *[0-9]*' "${CONFIG_DIR}/vpn-definitions.json" | sed 's/.*: *//' || echo "7200")
+        NETWORK_PREFIX=$(grep -o '"prefix": *"[^"]*"' "${CONFIG_DIR}/vpn-definitions.json" | sed 's/.*: *"//' | sed 's/"//' || echo "10.239")
+    else
+        # Default ranges for new installation
+        MIN_TABLE_ID=7001
+        MAX_TABLE_ID=7200
+        NETWORK_PREFIX="10.239"
+    fi
+    
+    # Check for routing tables in our range
+    if grep -qE "^${MIN_TABLE_ID}|^${MAX_TABLE_ID}" /etc/iproute2/rt_tables 2>/dev/null; then
+        if [ -f "${CONFIG_DIR}/vpn-definitions.json" ]; then
+            warning "Found routing tables in VPN router range (${MIN_TABLE_ID}-${MAX_TABLE_ID}). This is expected for an existing installation."
+        else
+            error "Found existing routing tables in the range ${MIN_TABLE_ID}-${MAX_TABLE_ID}. These conflict with VPN router."
+            error "Please choose a different routing table range or remove the conflicting tables."
+            return 1
+        fi
+    fi
+    
+    # Check for IP addresses in our range
+    if ip addr | grep -q "${NETWORK_PREFIX}\."; then
+        if [ -f "${CONFIG_DIR}/vpn-definitions.json" ]; then
+            warning "Found IP addresses in VPN router range (${NETWORK_PREFIX}). This is expected for an existing installation."
+        else
+            error "Found existing IP addresses in the range ${NETWORK_PREFIX}. These conflict with VPN router."
+            error "Please choose a different IP range or remove the conflicting addresses."
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+# Create configuration directory and default config files
+create_config_dir() {
+    log "Creating configuration directory..."
+    mkdir -p "$CONFIG_DIR"
+    
+    # Create default VPN definitions
+    log "Creating default VPN definitions..."
+    cat > "${CONFIG_DIR}/vpn-definitions.json.default" << EOF
+{
+  "system_config": {
+    "routing_table_id_range": {
+      "min": 7001,
+      "max": 7200
+    },
+    "veth_network_range": {
+      "prefix": "10.239"
+    }
+  },
+  "vpn_connections": []
+}
+EOF
+
+    # Create default client assignments
+    log "Creating default client assignments..."
+    cat > "${CONFIG_DIR}/vpn-clients.json.default" << EOF
+{
+  "assignments": []
+}
+EOF
+
+    # If no actual config files exist, copy the defaults
+    if [ ! -f "${CONFIG_DIR}/vpn-definitions.json" ]; then
+        log "No VPN definitions found, creating from default template"
+        cp "${CONFIG_DIR}/vpn-definitions.json.default" "${CONFIG_DIR}/vpn-definitions.json"
+    else
+        log "Existing VPN definitions found, keeping current configuration"
+    fi
+    
+    if [ ! -f "${CONFIG_DIR}/vpn-clients.json" ]; then
+        log "No client assignments found, creating from default template"
+        cp "${CONFIG_DIR}/vpn-clients.json.default" "${CONFIG_DIR}/vpn-clients.json"
+    else
+        log "Existing client assignments found, keeping current configuration"
+    fi
+    
+    # Set correct permissions
+    chmod 600 "${CONFIG_DIR}"/*.json*
+    chown root:root "${CONFIG_DIR}"/*.json*
+}
+
+# Install the VPN router scripts
+install_scripts() {
+    log "Installing VPN router scripts..."
+    
+    # Verify that scripts exist in the current directory
+    if [ ! -f "vpn-apply.py" ] || [ ! -f "vpn-router-check.py" ]; then
+        error "Required script files not found in the current directory"
+        error "Make sure vpn-apply.py and vpn-router-check.py are in the same directory as this install script"
+        exit 1
+    fi
+    
+    # Copy scripts to the destination directory
+    cp "vpn-apply.py" "${SCRIPT_DIR}/"
+    cp "vpn-router-check.py" "${SCRIPT_DIR}/"
+    
+    # Make scripts executable
+    chmod 755 "${SCRIPT_DIR}/vpn-apply.py"
+    chmod 755 "${SCRIPT_DIR}/vpn-router-check.py"
+    
+    log "VPN router scripts installed successfully"
+}
+
+# Install systemd service and timer
+install_systemd_units() {
+    log "Installing systemd service and timer files..."
+    
+    # Verify that systemd unit files exist in the current directory
+    if [ ! -f "vpn-router.service" ] || [ ! -f "vpn-router.timer" ]; then
+        error "Required systemd unit files not found in the current directory"
+        error "Make sure vpn-router.service and vpn-router.timer are in the same directory as this install script"
+        exit 1
+    }
+    
+    # Copy systemd unit files
+    cp "vpn-router.service" "${SYSTEMD_DIR}/"
+    cp "vpn-router.timer" "${SYSTEMD_DIR}/"
+    
+    # Set correct permissions
+    chmod 644 "${SYSTEMD_DIR}/vpn-router.service"
+    chmod 644 "${SYSTEMD_DIR}/vpn-router.timer"
+    
+    # Reload systemd to recognize the new units
+    systemctl daemon-reload
+    
+    # Enable and start the timer
+    log "Enabling and starting vpn-router.timer"
+    systemctl enable vpn-router.timer
+    systemctl start vpn-router.timer
+    
+    log "Systemd service and timer installed and activated successfully"
+    log "The vpn-router timer will run the VPN configuration periodically"
+}
+
+# Run the installation
+run_installation() {
+    log "Starting VPN Router installation..."
+    
+    check_requirements
+    check_for_conflicts || exit 1
+    create_config_dir
+    install_scripts
+    install_systemd_units
+    
+    log "VPN Router installation completed successfully!"
+    log "You can now configure your VPN connections in ${CONFIG_DIR}/vpn-definitions.json"
+    log "and client assignments in ${CONFIG_DIR}/vpn-clients.json"
+}
+
+run_installation
