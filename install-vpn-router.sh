@@ -5,7 +5,7 @@
 # This script installs and configures the VPN Router system.
 #
 # Created by: gtstud
-# Date: 2025-08-09 20:48:34
+# Date: 2025-08-09 20:56:19
 
 set -e
 
@@ -14,7 +14,7 @@ CONFIG_DIR="/etc/vpn-router"
 SCRIPT_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
 CURRENT_USER="gtstud"
-CURRENT_TIMESTAMP="2025-08-09 20:48:34"
+CURRENT_TIMESTAMP="2025-08-09 20:56:19"
 
 # ANSI colors for terminal output
 GREEN='\033[0;32m'
@@ -191,7 +191,7 @@ install_systemd_units() {
         error "Required systemd unit files not found in the current directory"
         error "Make sure vpn-router.service and vpn-router.timer are in the same directory as this install script"
         exit 1
-    }
+    fi
     
     # Copy systemd unit files
     cp "vpn-router.service" "${SYSTEMD_DIR}/"
