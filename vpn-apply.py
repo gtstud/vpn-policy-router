@@ -17,8 +17,6 @@ import logging
 import ipaddress
 from pathlib import Path
 from datetime import datetime
-import pwd
-import getpass
 
 # Configure logging
 logging.basicConfig(
@@ -160,10 +158,7 @@ class VPNRouter:
                 logger.error(f"Missing 'type' in VPN connection {vpn['name']}")
                 sys.exit(1)
                 
-            if vpn["type"] not in ["wireguard", "openvpn"]:
-                logger.error(f"Invalid 'type' in VPN connection {vpn['name']}: {vpn['type']}")
-                logger.error("Supported types are 'wireguard' and 'openvpn'")
-                sys.exit(1)
+            # Note: Removed OpenVPN/type check as requested
                 
             if "routing_table_id" not in vpn:
                 logger.error(f"Missing 'routing_table_id' in VPN connection {vpn['name']}")
@@ -355,33 +350,38 @@ class VPNRouter:
             elif answer in ['n', 'no']:
                 return False
                 
-    def _restart_systemd_service(self, service_name):
-        """Restart systemd service"""
+    def _reload_systemd_networkd(self):
+        """Reload systemd-networkd configuration"""
         if self.dry_run:
-            logger.info(f"Would restart systemd service: {service_name}")
+            logger.info("Would reload systemd-networkd configuration")
             return True
             
         try:
-            logger.info(f"Restarting systemd service: {service_name}")
-            subprocess.run(["systemctl", "restart", service_name], check=True)
+            # Try using networkctl reload first (preferred method)
+            logger.info("Reloading networkd configuration using networkctl...")
+            result = subprocess.run(["networkctl", "reload"], 
+                                  stdout=subprocess.PIPE, 
+                                  stderr=subprocess.PIPE)
+            
+            # If networkctl reload fails, fall back to systemctl reload
+            if result.returncode != 0:
+                logger.info("networkctl reload failed, falling back to systemctl reload...")
+                subprocess.run(["systemctl", "reload", "systemd-networkd.service"], check=True)
+                
+            logger.info("Network configuration reloaded successfully")
             return True
         except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to restart service {service_name}: {e}")
-            return False
+            logger.error(f"Failed to reload network configuration: {e}")
             
-    def _restart_systemd_networkd(self):
-        """Restart systemd-networkd service"""
-        if self.dry_run:
-            logger.info("Would restart systemd-networkd")
-            return True
-            
-        try:
-            logger.info("Restarting systemd-networkd...")
-            subprocess.run(["systemctl", "restart", "systemd-networkd.service"], check=True)
-            return True
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to restart systemd-networkd: {e}")
-            return False
+            # As a last resort, try restart if reload fails
+            try:
+                logger.warning("Reload failed, attempting restart as last resort...")
+                subprocess.run(["systemctl", "restart", "systemd-networkd.service"], check=True)
+                logger.info("Network configuration restarted successfully")
+                return True
+            except subprocess.CalledProcessError as e2:
+                logger.error(f"Failed to restart network configuration: {e2}")
+                return False
             
     def _apply_wireguard_config(self, vpn):
         """Apply WireGuard VPN configuration"""
@@ -561,140 +561,6 @@ ConfigureWithoutCarrier=yes
         })
         
         logger.info(f"Completed WireGuard configuration for {vpn_name}")
-        return True
-        
-    def _apply_openvpn_config(self, vpn):
-        """Apply OpenVPN configuration"""
-        vpn_name = vpn["name"]
-        veth_network = vpn["veth_network"]
-        routing_table_id = vpn["routing_table_id"]
-        network_prefix = self.vpn_definitions["system_config"]["veth_network_range"]["prefix"]
-        
-        logger.info(f"Applying OpenVPN configuration for {vpn_name}")
-        
-        # Create namespace service file
-        ns_service_content = f"""[Unit]
-Description=Network Namespace for VPN {vpn_name}
-After=network.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/bin/ip netns add ns-{vpn_name}
-ExecStop=/usr/bin/ip netns del ns-{vpn_name}
-
-[Install]
-WantedBy=multi-user.target
-"""
-        ns_service_path = SYSTEMD_DIR / f"vpn-ns-{vpn_name}.service"
-        self._write_file(ns_service_path, ns_service_content)
-        
-        # Create veth pair .netdev file
-        veth_netdev_content = f"""[NetDev]
-Name=v-{vpn_name}-v
-Kind=veth
-
-[Peer]
-Name=v-{vpn_name}-p
-"""
-        veth_netdev_path = NETWORKD_DIR / f"10-v-{vpn_name}-veth.netdev"
-        self._write_file(veth_netdev_path, veth_netdev_content)
-        
-        # Create veth parent .network file
-        veth_parent_network_content = f"""[Match]
-Name=v-{vpn_name}-v
-
-[Network]
-Address={network_prefix}.{veth_network}.1/24
-ConfigureWithoutCarrier=yes
-"""
-        veth_parent_network_path = NETWORKD_DIR / f"10-v-{vpn_name}-veth.network"
-        self._write_file(veth_parent_network_path, veth_parent_network_content)
-        
-        # Move peer device to namespace
-        if not self.dry_run:
-            logger.info(f"Setting up network namespace for {vpn_name}")
-            subprocess.run(["systemctl", "enable", "--now", f"vpn-ns-{vpn_name}.service"], check=True)
-            
-            # Wait for veth devices to appear
-            for _ in range(10):
-                result = subprocess.run(["ip", "link", "show", f"v-{vpn_name}-p"], 
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if result.returncode == 0:
-                    break
-                time.sleep(0.5)
-            
-            # Move peer to namespace
-            subprocess.run(["ip", "link", "set", f"v-{vpn_name}-p", "netns", f"ns-{vpn_name}"], check=True)
-        else:
-            logger.info(f"Would set up network namespace for {vpn_name}")
-            
-        # Create routing table entry
-        table_name = f"{vpn_name}_vpn"
-        rt_tables_path = Path("/etc/iproute2/rt_tables.d") / f"{vpn_name}_vpn.conf"
-        
-        # Ensure rt_tables.d directory exists
-        if not self.dry_run:
-            os.makedirs("/etc/iproute2/rt_tables.d", exist_ok=True)
-            
-        rt_tables_content = f"{routing_table_id} {table_name}\n"
-        self._write_file(rt_tables_path, rt_tables_content)
-        
-        # Create rules for peer interface inside namespace
-        if not self.dry_run:
-            logger.info(f"Configuring network inside namespace for {vpn_name}")
-            
-            # Configure IP in namespace
-            subprocess.run([
-                "ip", "netns", "exec", f"ns-{vpn_name}", 
-                "ip", "addr", "add", f"{network_prefix}.{veth_network}.2/24", 
-                "dev", f"v-{vpn_name}-p"
-            ], check=True)
-            
-            # Bring up interface in namespace
-            subprocess.run([
-                "ip", "netns", "exec", f"ns-{vpn_name}", 
-                "ip", "link", "set", "dev", f"v-{vpn_name}-p", "up"
-            ], check=True)
-            
-            # Add default route via veth in namespace
-            subprocess.run([
-                "ip", "netns", "exec", f"ns-{vpn_name}", 
-                "ip", "route", "add", "default", "via", f"{network_prefix}.{veth_network}.1"
-            ], check=True)
-            
-            # Start OpenVPN in namespace (user must handle this separately)
-            logger.info(f"NOTE: You must start OpenVPN manually inside namespace 'ns-{vpn_name}'")
-            logger.info(f"Example: ip netns exec ns-{vpn_name} openvpn --config /path/to/config.ovpn")
-        else:
-            logger.info(f"Would configure network inside namespace for {vpn_name}")
-            logger.info(f"NOTE: You must start OpenVPN manually inside namespace 'ns-{vpn_name}'")
-            
-        # Create rules for routing
-        for rule in self._generate_routing_rules(vpn):
-            self._apply_routing_rule(rule)
-            
-        # Record created resources
-        self.created_resources.append({
-            "type": "namespace",
-            "name": f"ns-{vpn_name}",
-            "vpn_name": vpn_name
-        })
-        
-        self.created_resources.append({
-            "type": "interface",
-            "name": f"v-{vpn_name}-v",
-            "vpn_name": vpn_name
-        })
-        
-        self.created_resources.append({
-            "type": "routing_table",
-            "id": routing_table_id,
-            "name": table_name,
-            "vpn_name": vpn_name
-        })
-        
-        logger.info(f"Completed OpenVPN configuration for {vpn_name}")
         return True
         
     def _generate_routing_rules(self, vpn):
@@ -1197,12 +1063,10 @@ Priority=100
         
         # Apply each VPN configuration
         for vpn in self.vpn_definitions["vpn_connections"]:
-            if vpn["type"] == "wireguard":
-                self._apply_wireguard_config(vpn)
-            elif vpn["type"] == "openvpn":
-                self._apply_openvpn_config(vpn)
+            # Only support wireguard - removed openvpn check
+            self._apply_wireguard_config(vpn)
                 
-        # Restart systemd-networkd if needed and not in dry run
+        # Reload systemd-networkd if needed and not in dry run
         if self.changed_files and not self.dry_run:
             # Check if any network or netdev files were changed
             network_files_changed = any(
@@ -1211,8 +1075,8 @@ Priority=100
             )
             
             if network_files_changed:
-                logger.info("Network configuration files changed, restarting systemd-networkd...")
-                self._restart_systemd_networkd()
+                logger.info("Network configuration files changed, reloading network configuration...")
+                self._reload_systemd_networkd()
                 
         if self.dry_run:
             logger.info("=== DRY RUN COMPLETED - No changes were applied ===")
