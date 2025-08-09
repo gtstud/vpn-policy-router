@@ -1,0 +1,12 @@
+[Unit]
+Description=Declarative Policy-Based VPN Router
+After=network.target systemd-networkd.service
+Documentation=https://github.com/gtstudis/vpn-policy-router
+
+[Service]
+Type=oneshot
+ExecStart=/opt/vpn-router/vpn-apply.py
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target
