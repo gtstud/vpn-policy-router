@@ -4,8 +4,8 @@
 #
 # This script installs and configures the VPN Router system.
 #
-# Created by: gtstud1
-# Date: 2025-08-09 20:40:39
+# Created by: gtstud
+# Date: 2025-08-09 20:48:34
 
 set -e
 
@@ -13,8 +13,8 @@ set -e
 CONFIG_DIR="/etc/vpn-router"
 SCRIPT_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
-CURRENT_USER="gtstud1"
-CURRENT_TIMESTAMP="2025-08-09 20:40:39"
+CURRENT_USER="gtstud"
+CURRENT_TIMESTAMP="2025-08-09 20:48:34"
 
 # ANSI colors for terminal output
 GREEN='\033[0;32m'
