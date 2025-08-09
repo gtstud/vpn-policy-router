@@ -144,6 +144,9 @@ class VPNRouter:
             logger.error("Missing 'prefix' in veth_network_range")
             sys.exit(1)
             
+        # Get network prefix for validation
+        network_prefix = network_range["prefix"]
+        
         # Validate VPN connections
         if "vpn_connections" not in self.vpn_definitions:
             logger.error("Missing 'vpn_connections' in vpn-definitions.json")
@@ -180,16 +183,46 @@ class VPNRouter:
                 logger.error(f"Duplicate veth network found: {vpn['veth_network']}")
                 sys.exit(1)
                 
-            # Validate veth network format (should be a number between 0-255)
+            # Validate veth network format
             try:
-                network_num = int(vpn["veth_network"])
-                if network_num < 0 or network_num > 255:
-                    logger.error(f"Invalid veth network number in {vpn['name']}: {vpn['veth_network']}")
-                    logger.error("Network number should be between 0-255")
-                    sys.exit(1)
-            except ValueError:
-                logger.error(f"Invalid veth network format in {vpn['name']}: {vpn['veth_network']}")
-                logger.error("Network should be a number between 0-255")
+                # Check if it's a valid CIDR subnet
+                veth_net = vpn["veth_network"]
+                
+                # If it's just a number, assume it's the third octet for a /30 subnet
+                if isinstance(veth_net, (int, str)) and str(veth_net).isdigit():
+                    third_octet = int(veth_net)
+                    if third_octet < 0 or third_octet > 255:
+                        logger.error(f"Invalid veth network number in {vpn['name']}: {veth_net}")
+                        logger.error("Network number should be between 0-255")
+                        sys.exit(1)
+                        
+                    # Construct the proper network with prefix
+                    full_network = f"{network_prefix}.{third_octet}.0/30"
+                    
+                    # Update the configuration with the proper CIDR format
+                    vpn["veth_network"] = full_network
+                else:
+                    # If it's already a string with CIDR notation, validate it
+                    try:
+                        network = ipaddress.IPv4Network(veth_net)
+                        
+                        # Check if it uses the correct prefix
+                        network_parts = str(network.network_address).split('.')
+                        expected_prefix = network_prefix.split('.')
+                        
+                        if len(network_parts) >= len(expected_prefix):
+                            for i, part in enumerate(expected_prefix):
+                                if network_parts[i] != part:
+                                    logger.error(f"Invalid network prefix in {vpn['name']}: {veth_net}")
+                                    logger.error(f"Expected prefix {network_prefix} does not match {'.'.join(network_parts[:len(expected_prefix)])}")
+                                    sys.exit(1)
+                    except ValueError:
+                        logger.error(f"Invalid veth network format in {vpn['name']}: {veth_net}")
+                        logger.error("Network should be in CIDR format (e.g., 10.239.1.0/30)")
+                        sys.exit(1)
+            except Exception as e:
+                logger.error(f"Error validating veth network in {vpn['name']}: {e}")
+                logger.error("Network should be either a number between 0-255 or a valid CIDR subnet")
                 sys.exit(1)
                 
         # Validate client assignments
@@ -376,16 +409,40 @@ class VPNRouter:
             except subprocess.CalledProcessError as e2:
                 logger.error(f"Failed to restart network configuration: {e2}")
                 return False
+
+    def _get_network_addresses(self, veth_network):
+        """Get IP addresses for veth pair from network CIDR"""
+        try:
+            # Parse the network
+            network = ipaddress.IPv4Network(veth_network)
+            
+            # Get the first two usable addresses in the network
+            hosts = list(network.hosts())
+            
+            if len(hosts) < 2:
+                logger.error(f"Network {veth_network} does not have enough addresses")
+                return None, None
+                
+            return str(hosts[0]), str(hosts[1])
+        except Exception as e:
+            logger.error(f"Error getting addresses from network {veth_network}: {e}")
+            return None, None
             
     def _apply_wireguard_config(self, vpn):
         """Apply WireGuard VPN configuration"""
         vpn_name = vpn["name"]
         veth_network = vpn["veth_network"]
         routing_table_id = vpn["routing_table_id"]
-        network_prefix = self.vpn_definitions["system_config"]["veth_network_range"]["prefix"]
         
         logger.info(f"Applying WireGuard VPN configuration for {vpn_name}")
         
+        # Get IP addresses for veth pair
+        host_ip, namespace_ip = self._get_network_addresses(veth_network)
+        
+        if not host_ip or not namespace_ip:
+            logger.error(f"Could not determine IP addresses for network {veth_network}")
+            return False
+            
         # Create namespace service file
         ns_service_content = f"""[Unit]
 Description=Network Namespace for VPN {vpn_name}
@@ -419,7 +476,7 @@ Name=v-{vpn_name}-p
 Name=v-{vpn_name}-v
 
 [Network]
-Address={network_prefix}.{veth_network}.1/24
+Address={host_ip}/30
 ConfigureWithoutCarrier=yes
 """
         veth_parent_network_path = NETWORKD_DIR / f"10-v-{vpn_name}-veth.network"
@@ -503,10 +560,14 @@ ConfigureWithoutCarrier=yes
         if not self.dry_run:
             logger.info(f"Configuring network inside namespace for {vpn_name}")
             
+            # Get network mask from CIDR notation
+            network = ipaddress.IPv4Network(veth_network)
+            prefix_len = network.prefixlen
+            
             # Configure IP in namespace
             subprocess.run([
                 "ip", "netns", "exec", f"ns-{vpn_name}", 
-                "ip", "addr", "add", f"{network_prefix}.{veth_network}.2/24", 
+                "ip", "addr", "add", f"{namespace_ip}/{prefix_len}", 
                 "dev", f"v-{vpn_name}-p"
             ], check=True)
             
@@ -519,7 +580,7 @@ ConfigureWithoutCarrier=yes
             # Add default route via veth in namespace
             subprocess.run([
                 "ip", "netns", "exec", f"ns-{vpn_name}", 
-                "ip", "route", "add", "default", "via", f"{network_prefix}.{veth_network}.1"
+                "ip", "route", "add", "default", "via", f"{host_ip}"
             ], check=True)
         else:
             logger.info(f"Would configure network inside namespace for {vpn_name}")
