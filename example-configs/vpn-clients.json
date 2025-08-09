@@ -1,0 +1,18 @@
+{
+  "assignments": [
+    {
+      "display_name": "Living-Room-TV",
+      "hostname": "lg-smart-tv.lan",
+      "ip_address": null,
+      "assigned_vpn": "vpn1",
+      "assignment_expiry": null
+    },
+    {
+      "display_name": "Work-Laptop",
+      "hostname": null,
+      "ip_address": "192.168.1.100",
+      "assigned_vpn": "vpn2",
+      "assignment_expiry": "2025-09-08T10:00:00Z"
+    }
+  ]
+}
