@@ -154,12 +154,6 @@ class VPNRouter:
                 logger.error(f"Missing 'name' in VPN connection at index {i}")
                 sys.exit(1)
                 
-            if "type" not in vpn:
-                logger.error(f"Missing 'type' in VPN connection {vpn['name']}")
-                sys.exit(1)
-                
-            # Note: Removed OpenVPN/type check as requested
-                
             if "routing_table_id" not in vpn:
                 logger.error(f"Missing 'routing_table_id' in VPN connection {vpn['name']}")
                 sys.exit(1)
@@ -1063,7 +1057,7 @@ Priority=100
         
         # Apply each VPN configuration
         for vpn in self.vpn_definitions["vpn_connections"]:
-            # Only support wireguard - removed openvpn check
+            # Apply wireguard config for all VPNs
             self._apply_wireguard_config(vpn)
                 
         # Reload systemd-networkd if needed and not in dry run
