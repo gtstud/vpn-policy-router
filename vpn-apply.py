@@ -48,6 +48,8 @@ class VpnRouter:
             "routing": False
         }
         self.changed_vpn_configs = set()
+        self.active_vpns = set()  # Track which VPNs are still actively used
+        self.removed_vpns = set()  # Track VPNs that should be removed
         
     def load_configuration(self) -> bool:
         """Load and validate configuration files"""
@@ -216,13 +218,129 @@ class VpnRouter:
                 # Client has a static IP, no resolution needed
                 resolved_client["resolved_ip"] = client["ip_address"]
                 self.resolved_assignments.append(resolved_client)
-    
+
+    def identify_active_and_removed_vpns(self) -> None:
+        """
+        Identify which VPNs are still active (have clients assigned) and 
+        which should be removed (no longer in definitions or no clients)
+        """
+        # Get all defined VPN names
+        defined_vpn_names = {vpn["name"] for vpn in self.vpn_definitions["vpn_connections"]}
+        
+        # Find VPNs that have active client assignments
+        self.active_vpns = set()
+        for client in self.resolved_assignments:
+            if client.get("assigned_vpn") is not None:
+                self.active_vpns.add(client["assigned_vpn"])
+        
+        # Find existing service files for VPNs
+        existing_vpn_services = set()
+        if Path("/etc/systemd/system").exists():
+            for service_file in Path("/etc/systemd/system").glob("vpn-ns-*.service"):
+                # Extract VPN name from service file (vpn-ns-{vpn_name}.service)
+                vpn_name = service_file.name.split("vpn-ns-")[1].split(".")[0]
+                existing_vpn_services.add(vpn_name)
+        
+        # Determine VPNs to remove:
+        # 1. VPNs with existing services that are not in defined_vpn_names
+        # 2. VPNs with existing services that are in defined_vpn_names but have no active clients
+        self.removed_vpns = {vpn for vpn in existing_vpn_services 
+                            if vpn not in defined_vpn_names or 
+                               (vpn in defined_vpn_names and vpn not in self.active_vpns)}
+        
+        # Log the results
+        if self.removed_vpns:
+            logger.info(f"VPNs to be removed: {', '.join(self.removed_vpns)}")
+        if self.active_vpns:
+            logger.info(f"Active VPNs: {', '.join(self.active_vpns)}")
+
+    def cleanup_removed_vpns(self) -> None:
+        """
+        Clean up services, namespaces, and configuration files for removed VPNs
+        """
+        if not self.removed_vpns:
+            return
+        
+        if self.dry_run:
+            logger.info("=== DRY RUN MODE - Would clean up these VPNs: " + 
+                       f"{', '.join(self.removed_vpns)} ===")
+            return
+        
+        daemon_reload_needed = False
+        
+        for vpn_name in self.removed_vpns:
+            logger.info(f"Cleaning up VPN '{vpn_name}'")
+            service_name = f"vpn-ns-{vpn_name}.service"
+            
+            # 1. Stop and disable service
+            logger.info(f"Stopping and disabling {service_name}")
+            subprocess.run(["systemctl", "stop", service_name],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(["systemctl", "disable", service_name],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            # 2. Remove service file
+            service_path = Path(f"/etc/systemd/system/{service_name}")
+            if service_path.exists():
+                logger.info(f"Removing service file {service_path}")
+                service_path.unlink()
+                daemon_reload_needed = True
+            
+            # 3. Remove network namespace if it exists
+            ns_name = f"ns-{vpn_name}"
+            check_ns = subprocess.run(["ip", "netns", "list"], 
+                                     capture_output=True, text=True)
+            if ns_name in check_ns.stdout:
+                logger.info(f"Removing network namespace {ns_name}")
+                subprocess.run(["ip", "netns", "del", ns_name],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            # 4. Remove networkd configuration files
+            prefixes = ["10", "20", "50"]
+            suffixes = ["netdev", "network", "rules"]
+            for prefix in prefixes:
+                for suffix in suffixes:
+                    pattern = f"{prefix}-*{vpn_name}*.{suffix}"
+                    for file_path in NETWORKD_PATH.glob(pattern):
+                        logger.info(f"Removing networkd file {file_path}")
+                        file_path.unlink(missing_ok=True)
+            
+            # 5. Remove routing table configuration
+            rt_table_path = Path(f"/etc/iproute2/rt_tables.d/{vpn_name}.conf")
+            if rt_table_path.exists():
+                logger.info(f"Removing routing table configuration {rt_table_path}")
+                rt_table_path.unlink()
+            
+            # 6. Check and remove any client rules pointing to this VPN
+            for file_path in NETWORKD_PATH.glob(f"50-{vpn_name}-client-*.rules"):
+                logger.info(f"Removing client rule {file_path}")
+                file_path.unlink(missing_ok=True)
+            
+            logger.info(f"Cleanup for VPN '{vpn_name}' completed")
+        
+        # Perform systemctl daemon-reload if needed
+        if daemon_reload_needed:
+            logger.info("Running systemctl daemon-reload after service file changes")
+            subprocess.run(["systemctl", "daemon-reload"],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+        # Reload networkd to apply changes
+        logger.info("Reloading systemd-networkd to apply configuration changes")
+        subprocess.run(["networkctl", "reload"],
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
     def generate_networkd_files(self) -> Dict[str, str]:
         """Generate systemd-networkd configuration files"""
         generated_files = {}
         
         for vpn in self.vpn_definitions["vpn_connections"]:
             vpn_name = vpn["name"]
+            
+            # Skip generating files for VPNs that have no clients assigned
+            if vpn_name not in self.active_vpns:
+                logger.info(f"Skipping generation of files for VPN '{vpn_name}' as it has no active clients")
+                continue
+                
             wg_if_name = f"v-{vpn_name}-w"
             veth_if_name = f"v-{vpn_name}-v"
             veth_peer_name = f"v-{vpn_name}-p"
@@ -342,6 +460,7 @@ WantedBy=multi-user.target
             for client in self.resolved_assignments:
                 if client.get("assigned_vpn") == vpn_name:
                     client_ip = client["resolved_ip"]
+                    client_id = client["display_name"].lower().replace(' ', '-')
                     policy_rule = f"""# Policy routing rule for client: {client['display_name']}
 # Routes traffic from this client through the {vpn_name} VPN
 
@@ -350,7 +469,7 @@ From={client_ip}/32
 Table={vpn["routing_table_name"]}
 Priority=100
 """
-                    policy_file = f"50-{vpn_name}-client-{client['display_name'].lower().replace(' ', '-')}.rules"
+                    policy_file = f"50-{vpn_name}-client-{client_id}.rules"
                     generated_files[f"{NETWORKD_PATH}/{policy_file}"] = policy_rule
         
         return generated_files
@@ -460,6 +579,12 @@ Priority=100
         self.prune_expired_clients()
         self.resolve_hostname_assignments()
         
+        # Identify which VPNs are active and which should be removed
+        self.identify_active_and_removed_vpns()
+        
+        # Clean up removed VPNs (stop services, remove namespaces, etc.)
+        self.cleanup_removed_vpns()
+        
         generated_files = self.generate_networkd_files()
         
         if self.dry_run:
@@ -524,9 +649,14 @@ Priority=100
             logger.info("Network configuration changed, reloading systemd-networkd")
             subprocess.run(["networkctl", "reload"])
         
-        # For each VPN in our configuration
+        # For each active VPN in our configuration
         for vpn in self.vpn_definitions["vpn_connections"]:
             vpn_name = vpn["name"]
+            
+            # Skip VPNs with no active clients
+            if vpn_name not in self.active_vpns:
+                continue
+                
             service_name = f"vpn-ns-{vpn_name}.service"
             
             # Enable the service (idempotent operation)
