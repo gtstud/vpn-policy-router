@@ -1,0 +1,11 @@
+[Unit]
+Description=Run VPN Router periodically
+After=network.target
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
