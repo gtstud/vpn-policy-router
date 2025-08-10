@@ -25,13 +25,10 @@ logger = logging.getLogger('vpn-assign')
 
 # Base directories
 CONFIG_DIR = Path("/etc/vpn-router")
-SYSTEMD_DIR = Path("/etc/systemd/system")
 
 # Config file paths
 VPN_DEFINITIONS_PATH = CONFIG_DIR / "vpn-definitions.json"
 VPN_CLIENTS_PATH = CONFIG_DIR / "vpn-clients.json"
-TIMER_PATH = SYSTEMD_DIR / "vpn-assign-cleanup.timer"
-SERVICE_PATH = SYSTEMD_DIR / "vpn-assign-cleanup.service"
 
 # Time units for duration parsing
 TIME_UNITS = {
@@ -349,139 +346,12 @@ def remove_all_assignments():
         return False
 
 
-def cleanup_expired():
-    """Clean up expired VPN assignments"""
-    # Load config
-    clients = load_json(VPN_CLIENTS_PATH)
-    
-    if "assignments" not in clients:
-        logger.debug("No assignments found")
-        return True
-        
-    current_time = datetime.now(tz=timezone.utc)
-    expired = []
-    active = []
-    
-    # Find expired assignments
-    for assignment in clients["assignments"]:
-        expiry = assignment.get("assignment_expiry")
-        
-        if not expiry:
-            # No expiry means permanent
-            active.append(assignment)
-            continue
-            
-        # Parse the expiry time
-        if isinstance(expiry, str):
-            try:
-                expiry_dt = datetime.fromisoformat(expiry.replace('Z', '+00:00'))
-                if expiry_dt < current_time:
-                    expired.append(assignment)
-                else:
-                    active.append(assignment)
-            except ValueError:
-                logger.warning(f"Invalid expiry format: {expiry}, treating as permanent")
-                active.append(assignment)
-        else:
-            logger.warning(f"Unexpected expiry format: {expiry}, treating as permanent")
-            active.append(assignment)
-            
-    if not expired:
-        logger.debug("No expired assignments found")
-        return True
-        
-    # Update with only active assignments
-    clients["assignments"] = active
-    
-    # Save updated config
-    if save_json(VPN_CLIENTS_PATH, clients):
-        logger.info(f"Cleaned up {len(expired)} expired assignments")
-        
-        # List expired clients
-        for exp in expired:
-            identifier = exp.get('ip_address') or exp.get('hostname')
-            logger.info(f"Expired: {identifier} (VPN: {exp.get('assigned_vpn')})")
-            
-        # Apply configuration to ensure VPN state matches assignments
-        apply_configuration()
-        
-        return True
-    else:
-        logger.error("Failed to save assignment changes")
-        return False
-
-
-def install_cleanup_timer():
-    """Install the cleanup timer for expired assignments"""
-    # Create service file
-    service_content = """[Unit]
-Description=VPN Assignment Cleanup Service
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/vpn-assign --cleanup-expired
-"""
-
-    # Create timer file
-    timer_content = """[Unit]
-Description=VPN Assignment Cleanup Timer
-After=network.target
-
-[Timer]
-OnBootSec=60
-OnUnitActiveSec=300
-AccuracySec=60
-
-[Install]
-WantedBy=timers.target
-"""
-
-    try:
-        # Write service file
-        with open(SERVICE_PATH, 'w') as f:
-            f.write(service_content)
-            
-        # Write timer file
-        with open(TIMER_PATH, 'w') as f:
-            f.write(timer_content)
-            
-        # Enable and start timer
-        subprocess.run(["systemctl", "enable", "--now", "vpn-assign-cleanup.timer"], check=True)
-        logger.info("Cleanup timer installed and started")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to install cleanup timer: {e}")
-        return False
-
-
-def remove_cleanup_timer():
-    """Remove the cleanup timer for expired assignments"""
-    try:
-        # Stop and disable timer
-        subprocess.run(["systemctl", "disable", "--now", "vpn-assign-cleanup.timer"],
-                      stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-        
-        # Remove files
-        if os.path.exists(TIMER_PATH):
-            os.unlink(TIMER_PATH)
-            
-        if os.path.exists(SERVICE_PATH):
-            os.unlink(SERVICE_PATH)
-            
-        logger.info("Cleanup timer removed")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to remove cleanup timer: {e}")
-        return False
-
-
 def apply_configuration():
     """Apply the VPN router configuration"""
     try:
         # Call vpn-apply script
         logger.info("Applying VPN router configuration...")
-        subprocess.run(["/usr/local/bin/vpn-apply"], check=True)
+        subprocess.run(["/usr/local/bin/vpn-apply", "--auto"], check=True)
         logger.info("VPN router configuration applied successfully")
         return True
     except subprocess.CalledProcessError as e:
@@ -512,9 +382,6 @@ def main():
     # Management options
     manage_group = parser.add_argument_group('Management Options')
     manage_group.add_argument("--list", action="store_true", help="List all client assignments")
-    manage_group.add_argument("--cleanup-expired", action="store_true", help="Clean up expired assignments")
-    manage_group.add_argument("--install-timer", action="store_true", help="Install the cleanup timer")
-    manage_group.add_argument("--remove-timer", action="store_true", help="Remove the cleanup timer")
     manage_group.add_argument("--remove", metavar="IDENTIFIER", help="Remove the assignment for the specified client (IP or hostname)")
     manage_group.add_argument("--remove-all", action="store_true", help="Remove all client assignments")
     
@@ -523,18 +390,6 @@ def main():
     # Handle management actions
     if args.list:
         list_vpns_and_clients()
-        return
-        
-    if args.cleanup_expired:
-        cleanup_expired()
-        return
-        
-    if args.install_timer:
-        install_cleanup_timer()
-        return
-        
-    if args.remove_timer:
-        remove_cleanup_timer()
         return
         
     if args.remove:
