@@ -27,6 +27,7 @@ This specification explicitly **excludes** port forwarding capabilities.
 | **Networking Service** | `systemd-networkd` | Declarative management of all network interfaces and routing. |
 | **Firewall Service** | `firewalld` | Manages security posture and network zones. |
 | **Automation Mechanism** | `systemd` Timer | Periodically runs `vpn-apply.py` to enforce state and prune expired assignments. |
+| **Rule application** | `nftables` | implement the NAT, etc. in namespaces |
 
 ## 3.0 Configuration Data Model
 
@@ -47,7 +48,7 @@ This file is the static source of truth for the VPN infrastructure.
 | `peer_endpoint` | String | The `hostname:port` of the remote WireGuard server. |
 | `vpn_assigned_ip` | String (CIDR) | The IP address assigned to the client by the VPN provider (e.g., "10.64.0.2/32"). |
 | `veth_network` | String (CIDR) | A private `/30` network used for the veth pair connecting the namespace to the main router. |
-| `routing_table_id` | Integer | A unique numeric ID (1-252) for the policy routing table. |
+| `routing_table_id` | Integer | A unique numeric ID (1-65000) for the policy routing table. |
 | `routing_table_name`| String | A unique string name for the policy routing table (e.g., "vpnX_tbl"). |
 | `router_lan_interface`| String | The name of the router's main LAN interface (e.g., "br0") where policy rules will be applied. |
 
@@ -92,9 +93,12 @@ The script MUST use Python's standard `logging` module to output detailed, times
 4.  **Phase 1: Build Resolved Assignment List:** Create an in-memory list of active, resolved assignments by performing DNS lookups for all hostname-based assignments. Unresolvable hosts are skipped for this run.
 5.  **Phase 2 & 3: Generate, Compare, and Apply:**
     *   Programmatically generate the required content for all `systemd-networkd` files and check `firewalld` state.
+    *   Also programatically generate the required namespace info and nftables rules that are required to make the system work 
     *   Compare the generated state with the live system state.
     *   **In `--dry-run` mode:** Print a detailed report of all file changes and service reloads that *would* occur.
     *   **In `apply` mode:** Overwrite outdated files, update `firewalld` zones, and execute `networkctl reload` or `firewall-cmd --reload` only if changes were detected.
+    *   All comparisons should be done between (1) generated content, (2) live state as reported by the system and (3) on-disk files that contribute to the live state of the system. Generated content should win.
+    *   All necessary changes should be done in "minimum necessary" mode - no "destroy and recreate"
 
 #### 4.1.4 Validation Logic (`--validate` mode)
 

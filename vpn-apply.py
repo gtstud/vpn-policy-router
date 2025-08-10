@@ -327,6 +327,16 @@ class VPNRouter:
                         return match.group(1)
         return None
 
+    def _get_nft_rule_handle(self, table, chain, rule_fragment):
+        result = self._run_cmd(['nft', '--handle', 'list', 'chain', table, chain], check=False)
+        if result and result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                if rule_fragment in line:
+                    match = re.search(r'handle\s+(\d+)', line)
+                    if match:
+                        return match.group(1)
+        return None
+
     def _sync_nftables_nat(self, active_vpns):
         logger.info("Synchronizing nftables NAT rules...")
         config = self.vpn_definitions['system_config']['nftables']
