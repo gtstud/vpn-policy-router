@@ -94,7 +94,7 @@ class VPNRouter:
 
             try:
                 ipaddress.ip_network(vpn['veth_network'])
-                ipaddress.ip_network(vpn['vpn_assigned_ip'])
+                ipaddress.ip_interface(vpn['vpn_assigned_ip']) # Use ip_interface for host IPs
             except ValueError as e:
                 raise ValueError(f"Invalid CIDR notation in VPN '{vpn['name']}': {e}")
 
