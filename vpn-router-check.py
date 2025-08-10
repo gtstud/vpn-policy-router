@@ -106,29 +106,25 @@ def check_system_resources(defined_vpns, vpn_config):
         except subprocess.CalledProcessError as e:
             print_colored(RED, f"Error checking firewalld zone '{vpn_zone}': {e.stderr}")
 
-    # Check for orphaned nftables rules
-    nftables_config = vpn_config.get('system_config', {}).get('nftables', {})
-    table = nftables_config.get('table')
-    chain = nftables_config.get('chain')
-    if table and chain:
-        try:
-            result = subprocess.run(["nft", "--handle", "list", "chain", table, chain], capture_output=True, text=True, check=True)
-            rules = result.stdout.strip().split('\n')
-            defined_veth_networks = {vpn['veth_network'] for vpn in vpn_config.get("vpn_connections", [])}
-
-            for rule in rules:
-                match = re.search(r'ip saddr (([0-9]{1,3}\.){3}[0-9]{1,3}/\d+)', rule)
-                if match:
-                    rule_saddr = match.group(1)
-                    if rule_saddr not in defined_veth_networks:
-                        handle_match = re.search(r'handle\s+(\d+)', rule)
-                        handle = handle_match.group(1) if handle_match else 'N/A'
-                        print_colored(YELLOW, f"Found orphaned nftables rule with source {rule_saddr} (handle: {handle})")
-                        orphaned.append({"name": rule, "type": "nftables_rule", "handle": handle, "table": table, "chain": chain})
-        except FileNotFoundError:
-            print_colored(RED, "nft not found. Skipping nftables check.")
-        except subprocess.CalledProcessError as e:
-            print_colored(RED, f"Error checking nftables chain '{table}/{chain}': {e.stderr}")
+    # Check for NAT rules inside namespaces
+    ns_output = subprocess.run(["ip", "netns", "list"], capture_output=True, text=True).stdout
+    for line in ns_output.splitlines():
+        ns_name = line.split()[0]
+        if ns_name.startswith("ns-"):
+            vpn_name = ns_name.replace("ns-", "")
+            if vpn_name in defined_vpns:
+                wg_if = f"v-{vpn_name}-w"
+                try:
+                    # Check for the masquerade rule
+                    cmd = f"ip netns exec {ns_name} nft list ruleset"
+                    result = subprocess.run(cmd.split(), capture_output=True, text=True, check=True)
+                    if f"oifname \"{wg_if}\" masquerade" not in result.stdout:
+                        print_colored(YELLOW, f"Missing NAT rule in namespace {ns_name} for interface {wg_if}")
+                        # Note: We can report this, but cleanup is not straightforward from here.
+                        # The main `vpn-apply.py` script should be the one to enforce this state.
+                except subprocess.CalledProcessError as e:
+                    if "No such file or directory" not in e.stderr: # It's ok if nft is not installed in the netns
+                        print_colored(RED, f"Error checking NAT rule in namespace {ns_name}: {e.stderr}")
 
     return orphaned
 
