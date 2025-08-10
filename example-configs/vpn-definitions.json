@@ -11,6 +11,10 @@
       "zone_lan": "internal",
       "zone_vpn": "vpn_out"
     },
+    "nftables": {
+      "table": "nat",
+      "chain": "POSTROUTING"
+    },
     "nat": {
       "lan_subnets": ["10.168.99.0/24"]
     }

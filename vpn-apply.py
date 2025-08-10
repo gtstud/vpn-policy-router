@@ -75,6 +75,11 @@ class VPNRouter:
         logger.debug("Validating configuration...")
         if "system_config" not in self.vpn_definitions:
             raise ValueError("Missing 'system_config' in vpn-definitions.json")
+
+        firewalld_config = self.vpn_definitions["system_config"].get("firewalld", {})
+        if "zone_vpn" not in firewalld_config:
+            raise ValueError("Missing 'zone_vpn' in system_config.firewalld in vpn-definitions.json")
+
         logger.debug("Configuration validation successful.")
 
     def _run_cmd(self, cmd, check=True):
@@ -213,43 +218,99 @@ class VPNRouter:
         for ip, table in (current_rules - desired_rules): self._run_cmd(['ip', 'rule', 'del', 'from', ip, 'lookup', table])
         for ip, table in (desired_rules - current_rules): self._run_cmd(['ip', 'rule', 'add', 'from', ip, 'lookup', table, 'priority', '1000'])
 
+    def _get_nft_rule_handle(self, table, chain, rule_fragment):
+        result = self._run_cmd(['nft', '--handle', 'list', 'chain', table, chain], check=False)
+        if result and result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                if rule_fragment in line:
+                    match = re.search(r'handle\s+(\d+)', line)
+                    if match:
+                        return match.group(1)
+        return None
+
     def _sync_nftables_nat(self, active_vpns):
         logger.info("Synchronizing nftables NAT rules...")
         config = self.vpn_definitions['system_config']['nftables']
-        table, chain = config['table'], config['chain_masquerade']
-        nft_config = f"flush chain {table} {chain}\n"
+        table, chain = config['table'], config['chain']
+
         for vpn_name in active_vpns:
             vpn = next((v for v in self.vpn_definitions['vpn_connections'] if v['name'] == vpn_name), None)
             if vpn:
-                lan_subnets = self.vpn_definitions['system_config']['nat']['lan_subnets']
-                nft_config += f"add rule {table} {chain} ip saddr {vpn['veth_network']} ip daddr != {{ {','.join(lan_subnets)} }} masquerade\n"
-        rules_file = CONFIG_DIR / "nftables.rules.tmp"
-        self._write_file(rules_file, nft_config)
-        self._run_cmd(['nft', '-f', str(rules_file)])
-        if not self.dry_run and rules_file.exists(): rules_file.unlink()
+                rule_fragment = f"ip saddr {vpn['veth_network']}"
+                handle = self._get_nft_rule_handle(table, chain, rule_fragment)
+                if not handle:
+                    logger.info(f"Adding NAT rule for {vpn_name}")
+                    lan_subnets = self.vpn_definitions['system_config']['nat']['lan_subnets']
+                    rule = f"ip saddr {vpn['veth_network']} ip daddr != {{ {','.join(lan_subnets)} }} masquerade"
+                    self._run_cmd(['nft', 'add', 'rule', table, chain, rule])
+
+    def _sync_firewalld_zones(self, active_vpns, orphaned_vpns):
+        logger.info("Synchronizing firewalld zones...")
+        firewalld_config = self.vpn_definitions['system_config'].get('firewalld', {})
+        vpn_zone = firewalld_config.get('zone_vpn')
+
+        if not vpn_zone:
+            logger.warning("firewalld 'zone_vpn' is not defined in system_config. Skipping zone management.")
+            return
+
+        # Add active veth interfaces to the VPN zone
+        for vpn_name in active_vpns:
+            veth_if = f"v-{vpn_name}-v"
+            result = self._run_cmd(['firewall-cmd', '--zone', vpn_zone, '--query-interface', veth_if], check=False)
+            if result and result.returncode != 0:
+                logger.info(f"Adding interface {veth_if} to firewalld zone {vpn_zone}")
+                self._run_cmd(['firewall-cmd', '--zone', vpn_zone, '--add-interface', veth_if, '--permanent'])
+                self.changed_files.add("firewalld_config")
+
+        # Remove orphaned veth interfaces from the VPN zone
+        for vpn_name in orphaned_vpns:
+            veth_if = f"v-{vpn_name}-v"
+            result = self._run_cmd(['firewall-cmd', '--zone', vpn_zone, '--query-interface', veth_if], check=False)
+            if result and result.returncode == 0:
+                logger.info(f"Removing interface {veth_if} from firewalld zone {vpn_zone}")
+                self._run_cmd(['firewall-cmd', '--zone', vpn_zone, '--remove-interface', veth_if, '--permanent'])
+                self.changed_files.add("firewalld_config")
+
+        if "firewalld_config" in self.changed_files:
+            self._run_cmd(['firewall-cmd', '--reload'])
 
     def _cleanup_vpn_resources(self, vpn_name):
         logger.info(f"Cleaning up resources for orphaned VPN '{vpn_name}'...")
         self._run_cmd(["systemctl", "disable", "--now", f"vpn-ns-{vpn_name}.service"], check=False)
+
+        # Cleanup nftables rule
+        vpn = next((v for v in self.vpn_definitions['vpn_connections'] if v['name'] == vpn_name), None)
+        if vpn:
+            config = self.vpn_definitions['system_config']['nftables']
+            table, chain = config['table'], config['chain']
+            rule_fragment = f"ip saddr {vpn['veth_network']}"
+            handle = self._get_nft_rule_handle(table, chain, rule_fragment)
+            if handle:
+                logger.info(f"Deleting NAT rule for orphaned VPN '{vpn_name}' (handle: {handle})")
+                self._run_cmd(['nft', 'delete', 'rule', table, chain, 'handle', handle])
+
         for f in self._get_vpn_resource_files(vpn_name):
             if f.exists():
                 logger.info(f"Removing file {f}")
                 if not self.dry_run: f.unlink()
         self.changed_files.add("deleted_vpn_files")
 
-    def _check_and_cleanup_orphans(self, active_vpns):
+    def _check_and_cleanup_orphans(self, orphaned_vpns):
         logger.info("Checking for orphaned VPN resources...")
-        system_vpn_names = {p.name.replace("vpn-ns-", "").replace(".service", "") for p in SYSTEMD_DIR.glob("vpn-ns-*.service")}
-        orphaned_vpns = system_vpn_names - active_vpns
         
         for vpn_name in orphaned_vpns:
+            logger.info(f"Processing orphaned VPN '{vpn_name}'...")
             files = self._get_vpn_resource_files(vpn_name)
-            is_modified = any(self._is_file_manually_modified(f) for f in files)
-            if is_modified:
+            modified_files = {f for f in files if self._is_file_manually_modified(f)}
+
+            if modified_files:
                 logger.warning(f"Orphaned VPN '{vpn_name}' has manually modified files and will not be cleaned up.")
                 for f in files:
-                    if f.exists(): logger.warning(f"  - {f}: {'modified' if self._is_file_manually_modified(f) else 'unchanged'}")
+                    if f.exists():
+                        status = "modified" if f in modified_files else "unchanged"
+                        logger.warning(f"  - {f}: {status}")
                 continue
+
             self._cleanup_vpn_resources(vpn_name)
 
     def run(self):
@@ -259,16 +320,26 @@ class VPNRouter:
         resolved_clients_map = self._resolve_assignments()
         active_vpns = set(resolved_clients_map.keys())
         self._manage_timer(enable=bool(self.vpn_clients.get("assignments")))
-        self._check_and_cleanup_orphans(active_vpns)
+
+        system_vpn_names = {p.name.replace("vpn-ns-", "").replace(".service", "") for p in SYSTEMD_DIR.glob("vpn-ns-*.service")}
+        orphaned_vpns = system_vpn_names - active_vpns
+
+        self._check_and_cleanup_orphans(orphaned_vpns)
+
         for vpn_name in active_vpns:
             vpn_config = next((v for v in self.vpn_definitions['vpn_connections'] if v['name'] == vpn_name), None)
             if vpn_config:
                 self._apply_vpn_config(vpn_config)
+
         self._sync_host_routing(resolved_clients_map)
         self._sync_nftables_nat(active_vpns)
+        self._sync_firewalld_zones(active_vpns, orphaned_vpns)
+
         if self.changed_files and not self.dry_run:
             logger.info("Configuration changed, reloading services...")
+            self._run_cmd(["systemctl", "daemon-reload"])
             self._run_cmd(["networkctl", "reload"])
+
         logger.info("Run completed.")
 
 def main():
