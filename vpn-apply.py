@@ -297,7 +297,7 @@ class VPNRouter:
         self._write_file(NETWORKD_DIR / f"10-{host_veth}.netdev", f"[NetDev]\nName={host_veth}\nKind=veth\n[Peer]\nName={ns_veth}", mode=network_files_mode, owner=network_files_owner, group=network_files_group)
         self._write_file(NETWORKD_DIR / f"10-{host_veth}.network", f"[Match]\nName={host_veth}\n[Network]\nAddress={host_ip}/30", mode=network_files_mode, owner=network_files_owner, group=network_files_group)
         self._write_file(NETWORKD_DIR / f"30-{ns_veth}.network", f"[Match]\nName={ns_veth}\n[Network]\nAddress={ns_ip}/30", mode=network_files_mode, owner=network_files_owner, group=network_files_group)
-        self._write_file(NETWORKD_DIR / f"20-{wg_if}.netdev", f"[NetDev]\nName={wg_if}\nKind=wireguard\n[WireGuard]\nPrivateKey={vpn['client_private_key']}", mode=0o600, owner=network_files_owner, group=network_files_group)
+        self._write_file(NETWORKD_DIR / f"20-{wg_if}.netdev", f"[NetDev]\nName={wg_if}\nKind=wireguard\n[WireGuard]\nPrivateKey={vpn['client_private_key']}", mode=network_files_mode, owner=network_files_owner, group=network_files_group)
         self._write_file(NETWORKD_DIR / f"30-{wg_if}.network", f"[Match]\nName={wg_if}\n[Network]\nAddress={vpn['vpn_assigned_ip']}\nDefaultRouteOnDevice=true\n[WireGuardPeer]\nPublicKey={vpn['peer_public_key']}\nEndpoint={vpn['peer_endpoint']}\nAllowedIPs=0.0.0.0/0", mode=network_files_mode, owner=network_files_owner, group=network_files_group)
 
         self._run_cmd(["systemctl", "daemon-reload"])
@@ -309,6 +309,12 @@ class VPNRouter:
             self._run_cmd(["ip", "link", "set", wg_if, "netns", ns_name], check=False)
             self._run_cmd(["ip", "link", "set", ns_veth, "netns", ns_name], check=False)
             self._run_cmd(["ip", "netns", "exec", ns_name, "systemctl", "restart", "systemd-networkd"], check=False)
+
+            # Setup NAT inside the namespace
+            logger.info(f"Setting up NAT inside namespace {ns_name}")
+            self._run_cmd(f"ip netns exec {ns_name} nft add table ip nat".split(), check=False)
+            self._run_cmd(f"ip netns exec {ns_name} nft add chain ip nat POSTROUTING {{ type nat hook postrouting priority 100 \; }}".split(), check=False)
+            self._run_cmd(f"ip netns exec {ns_name} nft add rule ip nat POSTROUTING oifname {wg_if} masquerade".split(), check=False)
         else:
             logger.error(f"Could not create interfaces for VPN '{vpn_name}'. Aborting configuration.")
 
@@ -373,32 +379,6 @@ class VPNRouter:
                     f.unlink()
                 self.changed_files.add("networkd_config")
 
-    def _get_nft_rule_handle(self, table, chain, rule_fragment):
-        result = self._run_cmd(['nft', '--handle', 'list', 'chain', table, chain], check=False)
-        if result and result.returncode == 0:
-            for line in result.stdout.strip().split('\n'):
-                if rule_fragment in line:
-                    match = re.search(r'handle\s+(\d+)', line)
-                    if match:
-                        return match.group(1)
-        return None
-
-    def _sync_nftables_nat(self, active_vpns):
-        logger.info("Synchronizing nftables NAT rules...")
-        config = self.vpn_definitions['system_config']['nftables']
-        table, chain = config['table'], config['chain']
-
-        for vpn_name in active_vpns:
-            vpn = next((v for v in self.vpn_definitions['vpn_connections'] if v['name'] == vpn_name), None)
-            if vpn:
-                rule_fragment = f"ip saddr {vpn['veth_network']}"
-                handle = self._get_nft_rule_handle(table, chain, rule_fragment)
-                if not handle:
-                    logger.info(f"Adding NAT rule for {vpn_name}")
-                    lan_subnets = self.vpn_definitions['system_config']['nat']['lan_subnets']
-                    rule = f"ip saddr {vpn['veth_network']} ip daddr != {{ {','.join(lan_subnets)} }} masquerade"
-                    self._run_cmd(['nft', 'add', 'rule', table, chain, rule])
-
     def _sync_firewalld_zones(self, active_vpns, orphaned_vpns):
         logger.info("Synchronizing firewalld zones...")
         firewalld_config = self.vpn_definitions['system_config'].get('firewalld', {})
@@ -428,34 +408,6 @@ class VPNRouter:
 
         if "firewalld_config" in self.changed_files:
             self._run_cmd(['firewall-cmd', '--reload'])
-
-    def _cleanup_orphaned_nftables_rules(self, active_vpns):
-        logger.info("Cleaning up orphaned nftables NAT rules...")
-        config = self.vpn_definitions['system_config'].get('nftables')
-        if not config:
-            return
-
-        table, chain = config['table'], config['chain']
-        active_veth_networks = {
-            vpn['veth_network']
-            for vpn in self.vpn_definitions.get("vpn_connections", [])
-            if vpn['name'] in active_vpns
-        }
-
-        result = self._run_cmd(['nft', '--handle', 'list', 'chain', table, chain], check=False)
-        if not result or result.returncode != 0:
-            return
-
-        for line in result.stdout.strip().split('\n'):
-            match = re.search(r'ip saddr (([0-9]{1,3}\.){3}[0-9]{1,3}/\d+)', line)
-            if match:
-                rule_saddr = match.group(1)
-                if rule_saddr not in active_veth_networks:
-                    handle_match = re.search(r'handle\s+(\d+)', line)
-                    if handle_match:
-                        handle = handle_match.group(1)
-                        logger.info(f"Deleting orphaned NAT rule with source {rule_saddr} (handle: {handle})")
-                        self._run_cmd(['nft', 'delete', 'rule', table, chain, 'handle', handle])
 
     def _cleanup_vpn_resources(self, vpn_name):
         logger.info(f"Cleaning up resources for orphaned VPN '{vpn_name}'...")
@@ -510,8 +462,6 @@ class VPNRouter:
                 self._apply_vpn_config(vpn_config)
 
         self._sync_routing_rules(resolved_clients_map)
-        self._sync_nftables_nat(active_vpns)
-        self._cleanup_orphaned_nftables_rules(active_vpns)
         self._sync_firewalld_zones(active_vpns, orphaned_vpns)
 
         if self.changed_files and not self.dry_run:
