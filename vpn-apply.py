@@ -59,7 +59,7 @@ class VPNRouter:
             template = {
                 "system_config": {
                     "firewalld": {"zone_lan": "trusted", "zone_vpn": "trusted"},
-                    "nftables": {"table": "nat", "chain": "POSTROUTING"},
+                    "lan_network_files": {},
                     "nat": {"lan_subnets": ["192.168.0.0/16"]}
                 },
                 "vpn_connections": []
@@ -81,6 +81,10 @@ class VPNRouter:
             raise ValueError("Missing 'firewalld.zone_vpn' in system_config")
         if "lan_network_files" not in self.vpn_definitions["system_config"]:
             raise ValueError("Missing 'lan_network_files' in system_config")
+
+        # The nftables config is no longer used from the host
+        if "nftables" in self.vpn_definitions["system_config"]:
+            logger.warning("The 'nftables' section in system_config is no longer used and can be removed.")
 
         vpn_conns = self.vpn_definitions.get("vpn_connections", [])
         seen_names = set()
@@ -312,9 +316,9 @@ class VPNRouter:
 
             # Setup NAT inside the namespace
             logger.info(f"Setting up NAT inside namespace {ns_name}")
-            self._run_cmd(f"ip netns exec {ns_name} nft add table ip nat".split(), check=False)
-            self._run_cmd(f"ip netns exec {ns_name} nft add chain ip nat POSTROUTING {{ type nat hook postrouting priority 100 \; }}".split(), check=False)
-            self._run_cmd(f"ip netns exec {ns_name} nft add rule ip nat POSTROUTING oifname {wg_if} masquerade".split(), check=False)
+            self._run_cmd(['ip', 'netns', 'exec', ns_name, 'nft', 'add', 'table', 'ip', 'nat'], check=False)
+            self._run_cmd(['ip', 'netns', 'exec', ns_name, 'nft', 'add', 'chain', 'ip', 'nat', 'POSTROUTING', '{ type nat hook postrouting priority 100 ; }'], check=False)
+            self._run_cmd(['ip', 'netns', 'exec', ns_name, 'nft', 'add', 'rule', 'ip', 'nat', 'POSTROUTING', 'oifname', wg_if, 'masquerade'], check=False)
         else:
             logger.error(f"Could not create interfaces for VPN '{vpn_name}'. Aborting configuration.")
 
