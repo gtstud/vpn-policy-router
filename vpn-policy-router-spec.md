@@ -52,8 +52,6 @@ This file is the static source of truth for the VPN infrastructure.
 | `routing_table_name`| String | A unique string name for the policy routing table (e.g., "vpnX_tbl"). |
 | `router_lan_interface`| String | The name of the router's main LAN interface (e.g., "br0") where policy rules will be applied. |
 | `system_config.firewalld.zone_vpn` | String | The `firewalld` zone where the host-side `veth` interfaces of active VPNs will be placed. |
-| `system_config.nftables.table` | String | The `nftables` table to use for NAT rules (e.g., "nat"). |
-| `system_config.nftables.chain` | String | The `nftables` chain to use for NAT rules (e.g., "POSTROUTING"). |
 | `system_config.lan_network_files` | Object | A mapping of LAN interface names to their corresponding `systemd-networkd` `.network` filenames (e.g., `{"br0": "10-lan.network"}`). |
 
 ### 3.2 `vpn-clients.json`
