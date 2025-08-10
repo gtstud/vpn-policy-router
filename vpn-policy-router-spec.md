@@ -25,7 +25,8 @@ This specification explicitly **excludes** port forwarding capabilities.
 | **State Enforcement Script**| `/usr/local/bin/vpn-apply.py` | Python script that enforces the state defined in the JSON files. |
 | **Assignment Script** | `/usr/local/bin/vpn-assign.py` | Python CLI tool for users to manage client assignments. |
 | **Networking Service** | `systemd-networkd` | Declarative management of all network interfaces and routing. |
-| **Firewall Service** | `firewalld` | Manages security posture and network zones. |
+| **Firewall Service** | `firewalld` | Manages the assignment of `veth` interfaces to security zones. |
+| **NAT Service** | `nftables` | Provides NAT (masquerade) functionality for VPN clients. |
 | **Automation Mechanism** | `systemd` Timer | Periodically runs `vpn-apply.py` to enforce state and prune expired assignments. |
 
 ## 3.0 Configuration Data Model
@@ -50,6 +51,10 @@ This file is the static source of truth for the VPN infrastructure.
 | `routing_table_id` | Integer | A unique numeric ID (1-252) for the policy routing table. |
 | `routing_table_name`| String | A unique string name for the policy routing table (e.g., "vpnX_tbl"). |
 | `router_lan_interface`| String | The name of the router's main LAN interface (e.g., "br0") where policy rules will be applied. |
+| `system_config.firewalld.zone_vpn` | String | The `firewalld` zone where the host-side `veth` interfaces of active VPNs will be placed. |
+| `system_config.nftables.table` | String | The `nftables` table to use for NAT rules (e.g., "nat"). |
+| `system_config.nftables.chain` | String | The `nftables` chain to use for NAT rules (e.g., "POSTROUTING"). |
+| `system_config.lan_network_files` | Object | A mapping of LAN interface names to their corresponding `systemd-networkd` `.network` filenames (e.g., `{"br0": "10-lan.network"}`). |
 
 ### 3.2 `vpn-clients.json`
 
@@ -91,10 +96,12 @@ The script MUST use Python's standard `logging` module to output detailed, times
 3.  **Phase 0: Prune Expired Clients:** Read `vpn-clients.json` and filter out any assignments where `assignment_expiry` has passed.
 4.  **Phase 1: Build Resolved Assignment List:** Create an in-memory list of active, resolved assignments by performing DNS lookups for all hostname-based assignments. Unresolvable hosts are skipped for this run.
 5.  **Phase 2 & 3: Generate, Compare, and Apply:**
-    *   Programmatically generate the required content for all `systemd-networkd` files and check `firewalld` state.
-    *   Compare the generated state with the live system state.
-    *   **In `--dry-run` mode:** Print a detailed report of all file changes and service reloads that *would* occur.
-    *   **In `apply` mode:** Overwrite outdated files, update `firewalld` zones, and execute `networkctl reload` or `firewall-cmd --reload` only if changes were detected.
+    *   **Orphan Cleanup:** Identify and remove all resources (systemd files, `nftables` rules, `firewalld` zone entries) associated with orphaned VPNs (i.e., those with no active clients). If any configuration files for an orphan have been manually modified, the cleanup for that orphan is skipped and a warning is logged.
+    *   **Active VPNs:** For each active VPN, ensure all required `systemd-networkd` files are created and up-to-date.
+    *   **Routing Rules:** Create per-client `systemd-networkd` drop-in files with `[RoutingPolicyRule]` sections to declaratively manage policy routing.
+    *   **Firewall:** Idempotently add the host-side `veth` interface for each active VPN to the configured `firewalld` zone.
+    *   **NAT:** Idempotently add an `nftables` masquerade rule for each active VPN.
+    *   **Service Reloads:** In `apply` mode, execute `systemctl daemon-reload`, `networkctl reload`, or `firewall-cmd --reload` only if changes were detected.
 
 #### 4.1.4 Validation Logic (`--validate` mode)
 
