@@ -79,6 +79,8 @@ class VPNRouter:
             raise ValueError("Missing 'system_config' in vpn-definitions.json")
         if "firewalld" not in self.vpn_definitions["system_config"] or "zone_vpn" not in self.vpn_definitions["system_config"]["firewalld"]:
             raise ValueError("Missing 'firewalld.zone_vpn' in system_config")
+        if "lan_network_files" not in self.vpn_definitions["system_config"]:
+            raise ValueError("Missing 'lan_network_files' in system_config")
 
         vpn_conns = self.vpn_definitions.get("vpn_connections", [])
         seen_names = set()
@@ -309,8 +311,14 @@ class VPNRouter:
                 clients_by_interface.setdefault(lan_if, []).append({'ip': ip, 'table': vpn['routing_table_id']})
 
         # For each LAN interface, sync the drop-in files
+        lan_network_files = self.vpn_definitions["system_config"]["lan_network_files"]
         for lan_if, clients in clients_by_interface.items():
-            dropin_dir = NETWORKD_DIR / f"{lan_if}.network.d"
+            network_file = lan_network_files.get(lan_if)
+            if not network_file:
+                logger.warning(f"No .network file defined for LAN interface '{lan_if}' in 'lan_network_files'. Cannot create routing rules.")
+                continue
+
+            dropin_dir = NETWORKD_DIR / f"{network_file}.d"
 
             # Get desired state
             desired_files = {f"10-vpn-router-{client['ip'].replace('.', '-')}.conf" for client in clients}
@@ -466,9 +474,15 @@ class VPNRouter:
         active_vpns = set(resolved_clients_map.keys())
         self._manage_timer(enable=bool(self.vpn_clients.get("assignments")))
 
-        system_vpn_names = {p.name.replace("vpn-ns-", "").replace(".service", "") for p in SYSTEMD_DIR.glob("vpn-ns-*.service")}
-        orphaned_vpns = system_vpn_names - active_vpns
+        # Discover all VPNs that have any system files
+        system_vpn_names = set()
+        for pattern in ["vpn-ns-*.service", "10-v-*-v.netdev", "10-v-*-v.network", "20-v-*-w.netdev", "30-v-*-w.network"]:
+            for f in (SYSTEMD_DIR if pattern.endswith('.service') else NETWORKD_DIR).glob(pattern):
+                match = re.search(r'ns-([a-zA-Z0-9_-]+)\.service', f.name) or re.search(r'v-([a-zA-Z0-9_-]+)-[vw]\.', f.name)
+                if match:
+                    system_vpn_names.add(match.groups()[-1])
 
+        orphaned_vpns = system_vpn_names - active_vpns
         self._check_and_cleanup_orphans(orphaned_vpns)
 
         for vpn_name in active_vpns:

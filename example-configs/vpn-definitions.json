@@ -17,6 +17,9 @@
     },
     "nat": {
       "lan_subnets": ["10.168.99.0/24"]
+    },
+    "lan_network_files": {
+      "br0": "10-lan.network"
     }
   },
   "vpn_connections": [
