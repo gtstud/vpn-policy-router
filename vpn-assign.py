@@ -1,243 +1,586 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-VPN Client Assignment Script
----------------------------
-This script manages client assignments to VPNs.
-Version: 1.0
-Date: 2025-08-09
+VPN Policy Router Assignment Tool
+This script manages client assignments to VPN connections
 """
 
-import argparse
-import fcntl
-import json
-import logging
-import subprocess
+import os
 import sys
-from datetime import datetime, timedelta, timezone
+import re
+import json
+import argparse
+import logging
+import ipaddress
+import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta, timezone
 
 # Configure logging
 logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger("vpn-router")
+logger = logging.getLogger('vpn-assign')
 
-# Constants
+# Base directories
 CONFIG_DIR = Path("/etc/vpn-router")
+SYSTEMD_DIR = Path("/etc/systemd/system")
+
+# Config file paths
 VPN_DEFINITIONS_PATH = CONFIG_DIR / "vpn-definitions.json"
 VPN_CLIENTS_PATH = CONFIG_DIR / "vpn-clients.json"
-VPN_APPLY_PATH = Path("/usr/local/bin/vpn-apply.py")
+TIMER_PATH = SYSTEMD_DIR / "vpn-assign-cleanup.timer"
+SERVICE_PATH = SYSTEMD_DIR / "vpn-assign-cleanup.service"
 
-def parse_duration(duration_str: str) -> Optional[datetime]:
-    """Parse a duration string into a future datetime"""
+# Time units for duration parsing
+TIME_UNITS = {
+    's': 1,
+    'm': 60,
+    'h': 3600,
+    'd': 86400,
+}
+
+
+def load_json(path):
+    """Load JSON from file"""
+    try:
+        if path.exists():
+            with open(path, 'r') as f:
+                return json.load(f)
+        else:
+            logger.warning(f"Config file not found: {path}")
+            return {}
+    except json.JSONDecodeError:
+        logger.error(f"Invalid JSON in {path}")
+        return {}
+    except Exception as e:
+        logger.error(f"Error loading config file {path}: {e}")
+        return {}
+
+
+def save_json(path, data):
+    """Save JSON to file"""
+    try:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception as e:
+        logger.error(f"Error saving to {path}: {e}")
+        return False
+
+
+def parse_duration(duration_str):
+    """Parse duration string with units (e.g., '1h', '30m', '1d')"""
     if not duration_str:
         return None
         
-    now = datetime.now(timezone.utc)
-    parts = duration_str.lower().split()
-    
-    if len(parts) != 2:
-        logger.error("Invalid duration format. Expected format: '30 days'")
-        return None
-    
-    try:
-        value = int(parts[0])
-        unit = parts[1]
-    except ValueError:
-        logger.error("Invalid duration value. Expected a number followed by a unit")
-        return None
-    
-    if unit.endswith('s'):
-        unit = unit[:-1]
-    
-    if unit == "minute" or unit == "min":
-        return now + timedelta(minutes=value)
-    elif unit == "hour" or unit == "hr":
-        return now + timedelta(hours=value)
-    elif unit == "day":
-        return now + timedelta(days=value)
-    elif unit == "week" or unit == "wk":
-        return now + timedelta(weeks=value)
-    elif unit == "month" or unit == "mo":
-        # Approximate a month as 30 days
-        return now + timedelta(days=value * 30)
-    else:
-        logger.error("Unknown duration unit. Supported units: minute, hour, day, week, month")
-        return None
+    # If it's just a number, assume seconds
+    if duration_str.isdigit():
+        return int(duration_str)
+        
+    match = re.match(r'^(\d+)([smhd])$', duration_str.lower())
+    if match:
+        value = int(match.group(1))
+        unit = match.group(2)
+        return value * TIME_UNITS[unit]
+        
+    raise ValueError(f"Invalid duration format: {duration_str}. Use format like '30s', '5m', '2h', '1d'")
 
-def list_vpns_and_clients() -> None:
-    """List available VPNs and client assignments"""
-    try:
-        with open(VPN_DEFINITIONS_PATH, 'r') as f:
-            vpn_defs = json.load(f)
-            
-        with open(VPN_CLIENTS_PATH, 'r') as f:
-            client_assignments = json.load(f)
-            
-        # Print available VPNs
-        print("\n=== Available VPN Connections ===")
-        print(f"{'Name':<15} {'Description':<30}")
-        print("-" * 45)
-        
-        for vpn in vpn_defs.get("vpn_connections", []):
-            print(f"{vpn.get('name', 'N/A'):<15} {vpn.get('description', 'N/A'):<30}")
-        
-        # Print client assignments
-        print("\n=== Client Assignments ===")
-        print(f"{'Display Name':<20} {'Identifier':<20} {'Assigned VPN':<15} {'Expires':<25}")
-        print("-" * 80)
-        
-        now = datetime.now(timezone.utc)
-        
-        for client in client_assignments.get("assignments", []):
-            # Determine the identifier (hostname or IP)
-            identifier = client.get("hostname") or client.get("ip_address") or "N/A"
-            
-            # Determine expiry
-            expiry = client.get("assignment_expiry")
-            if expiry:
-                expiry_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
-                if expiry_dt < now:
-                    expiry_str = "EXPIRED"
-                else:
-                    expiry_str = expiry_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-            else:
-                expiry_str = "Never (permanent)"
-            
-            print(f"{client.get('display_name', 'N/A'):<20} {identifier:<20} {client.get('assigned_vpn', 'Default'):<15} {expiry_str:<25}")
-            
-    except (json.JSONDecodeError, FileNotFoundError) as e:
-        logger.error(f"Error reading configuration: {e}")
-        sys.exit(1)
 
-def update_client_assignment(args) -> None:
-    """Create or update a client assignment"""
-    # Validate arguments
-    if args.vpn and args.vpn.lower() == "none":
-        vpn_name = None
-    else:
-        vpn_name = args.vpn
+def format_expiry(expiry_timestamp):
+    """Format expiry timestamp for display"""
+    if not expiry_timestamp:
+        return "Never (permanent)"
         
-    # Calculate expiry
-    if args.duration:
-        expiry_dt = parse_duration(args.duration)
-        if not expiry_dt:
-            logger.error("Invalid duration format")
-            sys.exit(1)
-        expiry = expiry_dt.isoformat().replace("+00:00", "Z")
-    else:
-        expiry = None
-    
-    # Acquire a lock on the clients file
     try:
-        with open(VPN_CLIENTS_PATH, 'r+') as f:
-            # Get an exclusive lock
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # If it's an ISO format string, parse it
+        if isinstance(expiry_timestamp, str):
+            expiry_time = datetime.fromisoformat(expiry_timestamp.replace('Z', '+00:00'))
+        else:
+            expiry_time = datetime.fromtimestamp(expiry_timestamp, tz=timezone.utc)
             
+        now = datetime.now(tz=timezone.utc)
+        
+        if expiry_time < now:
+            return "Expired"
+            
+        # Calculate remaining time
+        remaining = expiry_time - now
+        days = remaining.days
+        hours, remainder = divmod(remaining.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        # Format expiry string
+        expiry_str = expiry_time.strftime("%Y-%m-%d %H:%M:%S UTC")
+        
+        # Add remaining time
+        if days > 0:
+            remaining_str = f"{days}d {hours}h {minutes}m"
+        elif hours > 0:
+            remaining_str = f"{hours}h {minutes}m"
+        elif minutes > 0:
+            remaining_str = f"{minutes}m {seconds}s"
+        else:
+            remaining_str = f"{seconds}s"
+            
+        return f"{expiry_str} (remaining: {remaining_str})"
+    except Exception as e:
+        return f"Error parsing expiry: {e}"
+
+
+def find_client_by_identifier(identifier):
+    """Find a client by IP or hostname in the assignments list"""
+    clients = load_json(VPN_CLIENTS_PATH)
+    
+    if "assignments" not in clients:
+        return None
+        
+    for assignment in clients["assignments"]:
+        if assignment.get("ip_address") == identifier or assignment.get("hostname") == identifier:
+            return assignment
+            
+    return None
+
+
+def list_assignments():
+    """List all client VPN assignments"""
+    clients = load_json(VPN_CLIENTS_PATH)
+    vpn_defs = load_json(VPN_DEFINITIONS_PATH)
+    
+    if "assignments" not in clients or not clients["assignments"]:
+        print("No client assignments found")
+        return
+        
+    # Get a mapping of VPN names for display
+    vpn_names = {}
+    if "vpn_connections" in vpn_defs:
+        for vpn in vpn_defs["vpn_connections"]:
+            if "name" in vpn:
+                vpn_names[vpn["name"]] = vpn
+    
+    # Print header
+    print("\nCurrent VPN Assignments:")
+    print("-" * 100)
+    print(f"{'Display Name':<25} {'Hostname':<20} {'IP Address':<16} {'VPN':<15} {'Expiry':<30}")
+    print("-" * 100)
+    
+    # Sort assignments by expiry (permanent ones last)
+    def get_expiry_key(a):
+        expiry = a.get("assignment_expiry")
+        if not expiry:
+            return float('inf')
+        if isinstance(expiry, str):
             try:
-                client_assignments = json.load(f)
-            except json.JSONDecodeError:
-                logger.error("Invalid JSON in clients file")
-                sys.exit(1)
-            
-            # Find existing client or create new one
-            client_found = False
-            for i, client in enumerate(client_assignments.get("assignments", [])):
-                if client.get("display_name") == args.display_name:
-                    client_found = True
-                    
-                    # Cannot update hostname or IP for existing clients
-                    if args.ip or args.hostname:
-                        logger.error("Cannot update hostname or IP for existing clients")
-                        sys.exit(1)
-                    
-                    # Update VPN assignment and expiry
-                    client_assignments["assignments"][i]["assigned_vpn"] = vpn_name
-                    client_assignments["assignments"][i]["assignment_expiry"] = expiry
-                    logger.info(f"Updated client {args.display_name}")
-                    break
-            
-            # Create new client if not found
-            if not client_found:
-                if not args.ip and not args.hostname:
-                    logger.error("New clients require either --ip or --hostname")
-                    sys.exit(1)
-                
-                if args.ip and args.hostname:
-                    logger.error("Cannot specify both --ip and --hostname")
-                    sys.exit(1)
-                
-                new_client = {
-                    "display_name": args.display_name,
-                    "hostname": args.hostname,
-                    "ip_address": args.ip,
-                    "assigned_vpn": vpn_name,
-                    "assignment_expiry": expiry
-                }
-                
-                if "assignments" not in client_assignments:
-                    client_assignments["assignments"] = []
-                
-                client_assignments["assignments"].append(new_client)
-                logger.info(f"Created new client {args.display_name}")
-            
-            # Write updated configuration
-            f.seek(0)
-            f.truncate()
-            json.dump(client_assignments, f, indent=2)
-            
-            # Release lock
-            fcntl.flock(f, fcntl.LOCK_UN)
+                return datetime.fromisoformat(expiry.replace('Z', '+00:00')).timestamp()
+            except:
+                return float('inf')
+        return expiry
+        
+    sorted_assignments = sorted(
+        clients["assignments"],
+        key=get_expiry_key
+    )
     
-    except FileNotFoundError:
-        logger.error(f"Clients file not found: {VPN_CLIENTS_PATH}")
-        sys.exit(1)
-    except IOError:
-        logger.error("Could not acquire lock on clients file")
-        sys.exit(1)
+    # Print each assignment
+    for assignment in sorted_assignments:
+        display_name = assignment.get("display_name", "")
+        hostname = assignment.get("hostname", "") or ""
+        ip_address = assignment.get("ip_address", "") or ""
+        vpn_name = assignment.get("assigned_vpn", "direct")
+        expiry = format_expiry(assignment.get("assignment_expiry"))
+        
+        print(f"{display_name:<25} {hostname:<20} {ip_address:<16} {vpn_name:<15} {expiry:<30}")
     
-    # Apply the changes
+    print("-" * 100)
+
+
+def create_assignment(ip_address, hostname, vpn_name, expiry=None, display_name=None):
+    """Create a new VPN assignment for a client"""
+    if not ip_address and not hostname:
+        logger.error("Either IP address or hostname is required")
+        return False
+        
+    if not vpn_name:
+        logger.error("VPN name is required")
+        return False
+        
+    # Load configs
+    clients = load_json(VPN_CLIENTS_PATH)
+    vpn_defs = load_json(VPN_DEFINITIONS_PATH)
+    
+    # Initialize clients structure if needed
+    if not clients:
+        clients = {"assignments": []}
+        
+    if "assignments" not in clients:
+        clients["assignments"] = []
+        
+    # Check if VPN exists
+    valid_vpns = [vpn["name"] for vpn in vpn_defs.get("vpn_connections", [])]
+    if vpn_name != "direct" and vpn_name not in valid_vpns:
+        logger.error(f"Invalid VPN name: {vpn_name}. Valid options: {', '.join(valid_vpns)} or 'direct'")
+        return False
+        
+    # Check if client already exists - match by either IP or hostname
+    existing_idx = None
+    client_identifier = ip_address or hostname
+    
+    for i, assignment in enumerate(clients["assignments"]):
+        if (ip_address and assignment.get("ip_address") == ip_address) or \
+           (hostname and assignment.get("hostname") == hostname):
+            existing_idx = i
+            break
+            
+    # Create assignment object
+    assignment = {
+        "display_name": display_name or client_identifier,
+        "hostname": hostname,
+        "ip_address": ip_address,
+        "assigned_vpn": vpn_name,
+    }
+    
+    if expiry is not None:
+        # Format in ISO 8601 with UTC timezone
+        if isinstance(expiry, float) or isinstance(expiry, int):
+            dt = datetime.fromtimestamp(expiry, tz=timezone.utc)
+            assignment["assignment_expiry"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            assignment["assignment_expiry"] = expiry
+    else:
+        assignment["assignment_expiry"] = None
+        
+    # Update or append
+    if existing_idx is not None:
+        clients["assignments"][existing_idx] = assignment
+        logger.info(f"Updated assignment for {client_identifier} to VPN {vpn_name}")
+    else:
+        clients["assignments"].append(assignment)
+        logger.info(f"Created new assignment for {client_identifier} to VPN {vpn_name}")
+        
+    # Save updated config
+    if save_json(VPN_CLIENTS_PATH, clients):
+        logger.info("Assignment saved successfully")
+        
+        # Apply the configuration if not a direct assignment
+        if vpn_name != "direct":
+            apply_configuration()
+            
+        return True
+    else:
+        logger.error("Failed to save assignment")
+        return False
+
+
+def remove_assignment(identifier):
+    """Remove a client's VPN assignment by IP or hostname"""
+    if not identifier:
+        logger.error("Client identifier (IP or hostname) is required")
+        return False
+        
+    # Load config
+    clients = load_json(VPN_CLIENTS_PATH)
+    
+    if "assignments" not in clients:
+        logger.error(f"No assignments found")
+        return False
+        
+    # Find and remove the assignment
+    found = False
+    for i, assignment in enumerate(clients["assignments"]):
+        if assignment.get("ip_address") == identifier or assignment.get("hostname") == identifier:
+            logger.info(f"Found assignment for {identifier}: VPN={assignment.get('assigned_vpn')}")
+            del clients["assignments"][i]
+            found = True
+            break
+            
+    if not found:
+        logger.error(f"No assignment found for client {identifier}")
+        return False
+        
+    # Save updated config
+    if save_json(VPN_CLIENTS_PATH, clients):
+        logger.info(f"Removed assignment for client {identifier}")
+        
+        # Apply configuration to ensure VPN state matches assignments
+        apply_configuration()
+        
+        return True
+    else:
+        logger.error("Failed to save assignment changes")
+        return False
+
+
+def remove_all_assignments():
+    """Remove all client VPN assignments"""
+    # Load config
+    clients = load_json(VPN_CLIENTS_PATH)
+    
+    if "assignments" not in clients or not clients["assignments"]:
+        logger.info("No assignments to remove")
+        return True
+        
+    # Count assignments
+    count = len(clients["assignments"])
+    
+    # Clear all assignments
+    clients["assignments"] = []
+    
+    # Save updated config
+    if save_json(VPN_CLIENTS_PATH, clients):
+        logger.info(f"Removed all {count} client assignments")
+        
+        # Apply configuration to ensure VPN state matches assignments
+        apply_configuration()
+        
+        return True
+    else:
+        logger.error("Failed to save assignment changes")
+        return False
+
+
+def cleanup_expired():
+    """Clean up expired VPN assignments"""
+    # Load config
+    clients = load_json(VPN_CLIENTS_PATH)
+    
+    if "assignments" not in clients:
+        logger.debug("No assignments found")
+        return True
+        
+    current_time = datetime.now(tz=timezone.utc)
+    expired = []
+    active = []
+    
+    # Find expired assignments
+    for assignment in clients["assignments"]:
+        expiry = assignment.get("assignment_expiry")
+        
+        if not expiry:
+            # No expiry means permanent
+            active.append(assignment)
+            continue
+            
+        # Parse the expiry time
+        if isinstance(expiry, str):
+            try:
+                expiry_dt = datetime.fromisoformat(expiry.replace('Z', '+00:00'))
+                if expiry_dt < current_time:
+                    expired.append(assignment)
+                else:
+                    active.append(assignment)
+            except ValueError:
+                logger.warning(f"Invalid expiry format: {expiry}, treating as permanent")
+                active.append(assignment)
+        else:
+            logger.warning(f"Unexpected expiry format: {expiry}, treating as permanent")
+            active.append(assignment)
+            
+    if not expired:
+        logger.debug("No expired assignments found")
+        return True
+        
+    # Update with only active assignments
+    clients["assignments"] = active
+    
+    # Save updated config
+    if save_json(VPN_CLIENTS_PATH, clients):
+        logger.info(f"Cleaned up {len(expired)} expired assignments")
+        
+        # List expired clients
+        for exp in expired:
+            identifier = exp.get('ip_address') or exp.get('hostname')
+            logger.info(f"Expired: {identifier} (VPN: {exp.get('assigned_vpn')})")
+            
+        # Apply configuration to ensure VPN state matches assignments
+        apply_configuration()
+        
+        return True
+    else:
+        logger.error("Failed to save assignment changes")
+        return False
+
+
+def install_cleanup_timer():
+    """Install the cleanup timer for expired assignments"""
+    # Create service file
+    service_content = """[Unit]
+Description=VPN Assignment Cleanup Service
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vpn-assign --cleanup-expired
+"""
+
+    # Create timer file
+    timer_content = """[Unit]
+Description=VPN Assignment Cleanup Timer
+After=network.target
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=300
+AccuracySec=60
+
+[Install]
+WantedBy=timers.target
+"""
+
     try:
-        subprocess.run([str(VPN_APPLY_PATH)], check=True)
-        logger.info("Configuration applied successfully")
-    except subprocess.CalledProcessError:
-        logger.error("Failed to apply configuration")
-        sys.exit(1)
+        # Write service file
+        with open(SERVICE_PATH, 'w') as f:
+            f.write(service_content)
+            
+        # Write timer file
+        with open(TIMER_PATH, 'w') as f:
+            f.write(timer_content)
+            
+        # Enable and start timer
+        subprocess.run(["systemctl", "enable", "--now", "vpn-assign-cleanup.timer"], check=True)
+        logger.info("Cleanup timer installed and started")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to install cleanup timer: {e}")
+        return False
+
+
+def remove_cleanup_timer():
+    """Remove the cleanup timer for expired assignments"""
+    try:
+        # Stop and disable timer
+        subprocess.run(["systemctl", "disable", "--now", "vpn-assign-cleanup.timer"],
+                      stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        
+        # Remove files
+        if os.path.exists(TIMER_PATH):
+            os.unlink(TIMER_PATH)
+            
+        if os.path.exists(SERVICE_PATH):
+            os.unlink(SERVICE_PATH)
+            
+        logger.info("Cleanup timer removed")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to remove cleanup timer: {e}")
+        return False
+
+
+def apply_configuration():
+    """Apply the VPN router configuration"""
+    try:
+        # Call vpn-apply script
+        logger.info("Applying VPN router configuration...")
+        subprocess.run(["/usr/local/bin/vpn-apply"], check=True)
+        logger.info("VPN router configuration applied successfully")
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to apply VPN configuration: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Error applying VPN configuration: {e}")
+        return False
+
 
 def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description="VPN Client Assignment Tool")
+    """Main function"""
+    parser = argparse.ArgumentParser(description="VPN Assignment Tool")
     
-    parser.add_argument("--list", action="store_true", help="List available VPNs and current client assignments")
+    # Client identifier options
+    client_group = parser.add_argument_group('Client Identification')
+    client_group.add_argument("--ip", help="Specify client by IP address")
+    client_group.add_argument("--hostname", help="Specify client by hostname")
+    client_group.add_argument("--display-name", help="Set a friendly display name for the client")
     
-    # Client assignment options
-    parser.add_argument("--display-name", help="Unique display name for the client")
-    parser.add_argument("--vpn", help="VPN to assign to the client (use 'none' for default routing)")
-    parser.add_argument("--ip", help="Static IP address of the client")
-    parser.add_argument("--hostname", help="DNS hostname of the client")
-    parser.add_argument("--duration", help="Assignment duration (e.g., '30 days')")
+    # Assignment options
+    assign_group = parser.add_argument_group('Assignment Options')
+    assign_group.add_argument("--vpn", help="VPN name to assign the client to")
+    assign_group.add_argument("--duration", help="Duration of assignment in seconds or with units (e.g., 30s, 5m, 2h, 1d)")
+    assign_group.add_argument("--expire-at", help="Specific timestamp when the assignment expires (YYYY-MM-DD HH:MM:SS)")
+    assign_group.add_argument("--permanent", action="store_true", help="Make the assignment permanent (never expires)")
+    
+    # Management options
+    manage_group = parser.add_argument_group('Management Options')
+    manage_group.add_argument("--list", action="store_true", help="List all client assignments")
+    manage_group.add_argument("--cleanup-expired", action="store_true", help="Clean up expired assignments")
+    manage_group.add_argument("--install-timer", action="store_true", help="Install the cleanup timer")
+    manage_group.add_argument("--remove-timer", action="store_true", help="Remove the cleanup timer")
+    manage_group.add_argument("--remove", metavar="IDENTIFIER", help="Remove the assignment for the specified client (IP or hostname)")
+    manage_group.add_argument("--remove-all", action="store_true", help="Remove all client assignments")
     
     args = parser.parse_args()
     
-    # Default to list mode if no arguments provided
-    if len(sys.argv) == 1:
-        list_vpns_and_clients()
-        sys.exit(0)
-    
-    # Handle list mode
+    # Handle management actions
     if args.list:
-        list_vpns_and_clients()
-        sys.exit(0)
+        list_assignments()
+        return
+        
+    if args.cleanup_expired:
+        cleanup_expired()
+        return
+        
+    if args.install_timer:
+        install_cleanup_timer()
+        return
+        
+    if args.remove_timer:
+        remove_cleanup_timer()
+        return
+        
+    if args.remove:
+        remove_assignment(args.remove)
+        return
+        
+    if args.remove_all:
+        remove_all_assignments()
+        return
+        
+    # For assignments, need client ID and VPN
+    ip_address = args.ip
+    hostname = args.hostname
     
-    # Handle update/create mode
-    if args.display_name and args.vpn:
-        update_client_assignment(args)
-    else:
-        parser.error("--display-name and --vpn are required for updating client assignments")
+    if not ip_address and not hostname:
+        if args.vpn:
+            logger.error("Client identification required. Specify --ip or --hostname.")
+            return
+        else:
+            # If no specific action, show help
+            parser.print_help()
+            return
+            
+    if not args.vpn:
+        logger.error("VPN name required. Specify --vpn.")
+        return
+        
+    # Calculate expiry time
+    expiry = None
+    
+    if args.permanent:
+        expiry = None
+    elif args.expire_at:
+        try:
+            expiry_dt = datetime.strptime(args.expire_at, "%Y-%m-%d %H:%M:%S")
+            expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+            expiry = expiry_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            logger.error("Invalid expire-at format. Use YYYY-MM-DD HH:MM:SS")
+            return
+    elif args.duration:
+        try:
+            duration_seconds = parse_duration(args.duration)
+            if duration_seconds:
+                expiry_dt = datetime.now(tz=timezone.utc) + timedelta(seconds=duration_seconds)
+                expiry = expiry_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError as e:
+            logger.error(str(e))
+            return
+            
+    # Create the assignment
+    create_assignment(ip_address, hostname, args.vpn, expiry, args.display_name)
+
 
 if __name__ == "__main__":
     main()
