@@ -28,20 +28,18 @@ def print_colored(color, message):
     """Print colored message"""
     print(f"{color}{message}{NC}")
 
-def get_defined_vpns():
-    """Get list of all defined VPN names from configuration"""
-    defined_vpns = []
+def get_vpn_config():
+    """Load and return the VPN configuration."""
     if VPN_DEFINITIONS_PATH.exists():
         try:
             with open(VPN_DEFINITIONS_PATH, 'r') as f:
-                config = json.load(f)
-            defined_vpns = [vpn["name"] for vpn in config.get("vpn_connections", [])]
+                return json.load(f)
         except Exception as e:
             print_colored(RED, f"Error loading VPN definitions: {e}")
-    return defined_vpns
+    return None
 
-def check_system_resources(defined_vpns):
-    """Check for orphaned system resources (interfaces, namespaces, files)."""
+def check_system_resources(defined_vpns, vpn_config):
+    """Check for orphaned system resources (interfaces, namespaces, files, firewalld)."""
     print_colored(GREEN, "Checking system resources...")
     orphaned = []
     
@@ -88,7 +86,26 @@ def check_system_resources(defined_vpns):
             if vpn_name not in defined_vpns:
                 print_colored(YELLOW, f"Found orphaned file: {f}")
                 orphaned.append({"name": str(f), "type": "file"})
-                
+
+    # Check for orphaned interfaces in firewalld zone
+    firewalld_config = vpn_config.get('system_config', {}).get('firewalld', {})
+    vpn_zone = firewalld_config.get('zone_vpn')
+    if vpn_zone:
+        try:
+            result = subprocess.run(["firewall-cmd", "--zone", vpn_zone, "--list-interfaces"], capture_output=True, text=True, check=True)
+            interfaces_in_zone = result.stdout.strip().split()
+            for if_name in interfaces_in_zone:
+                match = re.search(r'v-([a-zA-Z0-9_-]+)-v', if_name)
+                if match:
+                    vpn_name = match.group(1)
+                    if vpn_name not in defined_vpns:
+                        print_colored(YELLOW, f"Found orphaned interface in firewalld zone '{vpn_zone}': {if_name}")
+                        orphaned.append({"name": if_name, "type": "firewalld_interface", "zone": vpn_zone})
+        except FileNotFoundError:
+            print_colored(RED, "firewall-cmd not found. Skipping firewalld check.")
+        except subprocess.CalledProcessError as e:
+            print_colored(RED, f"Error checking firewalld zone '{vpn_zone}': {e.stderr}")
+
     return orphaned
 
 def cleanup_resources(orphaned_resources, dry_run=True):
@@ -112,16 +129,23 @@ def cleanup_resources(orphaned_resources, dry_run=True):
             cmd = ["ip", "link", "delete", res_name]
         elif res_type == "namespace":
             cmd = ["ip", "netns", "delete", res_name]
+        elif res_type == "firewalld_interface":
+            cmd = ["firewall-cmd", "--zone", resource['zone'], "--remove-interface", res_name, "--permanent"]
 
         if cmd:
             if not dry_run:
                 try:
                     subprocess.run(cmd, check=True)
                     print_colored(GREEN, f"  -> Removed {res_type}: {res_name}")
+                    if res_type == "firewalld_interface":
+                        subprocess.run(["firewall-cmd", "--reload"], check=True)
                 except Exception as e:
                     print_colored(RED, f"  -> Failed to remove {res_type}: {e}")
             else:
                 print(f"  -> Would run: {' '.join(cmd)}")
+                if res_type == "firewalld_interface":
+                    print("  -> Would run: firewall-cmd --reload")
+
     print_colored(YELLOW, f"--- {mode} Complete ---")
 
 def main():
@@ -130,11 +154,15 @@ def main():
     parser.add_argument("--clean", action="store_true", help="Clean up orphaned resources.")
     args = parser.parse_args()
 
-    defined_vpns = get_defined_vpns()
+    vpn_config = get_vpn_config()
+    if not vpn_config:
+        sys.exit(1)
+
+    defined_vpns = [vpn["name"] for vpn in vpn_config.get("vpn_connections", [])]
     print_colored(GREEN, f"Found {len(defined_vpns)} defined VPNs: {', '.join(defined_vpns) if defined_vpns else 'none'}")
     print("-" * 30)
 
-    orphaned_resources = check_system_resources(defined_vpns)
+    orphaned_resources = check_system_resources(defined_vpns, vpn_config)
     
     print("-" * 30)
     if not orphaned_resources:
