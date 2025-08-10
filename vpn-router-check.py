@@ -106,6 +106,30 @@ def check_system_resources(defined_vpns, vpn_config):
         except subprocess.CalledProcessError as e:
             print_colored(RED, f"Error checking firewalld zone '{vpn_zone}': {e.stderr}")
 
+    # Check for orphaned nftables rules
+    nftables_config = vpn_config.get('system_config', {}).get('nftables', {})
+    table = nftables_config.get('table')
+    chain = nftables_config.get('chain')
+    if table and chain:
+        try:
+            result = subprocess.run(["nft", "--handle", "list", "chain", table, chain], capture_output=True, text=True, check=True)
+            rules = result.stdout.strip().split('\n')
+            defined_veth_networks = {vpn['veth_network'] for vpn in vpn_config.get("vpn_connections", [])}
+
+            for rule in rules:
+                match = re.search(r'ip saddr (([0-9]{1,3}\.){3}[0-9]{1,3}/\d+)', rule)
+                if match:
+                    rule_saddr = match.group(1)
+                    if rule_saddr not in defined_veth_networks:
+                        handle_match = re.search(r'handle\s+(\d+)', rule)
+                        handle = handle_match.group(1) if handle_match else 'N/A'
+                        print_colored(YELLOW, f"Found orphaned nftables rule with source {rule_saddr} (handle: {handle})")
+                        orphaned.append({"name": rule, "type": "nftables_rule", "handle": handle, "table": table, "chain": chain})
+        except FileNotFoundError:
+            print_colored(RED, "nft not found. Skipping nftables check.")
+        except subprocess.CalledProcessError as e:
+            print_colored(RED, f"Error checking nftables chain '{table}/{chain}': {e.stderr}")
+
     return orphaned
 
 def cleanup_resources(orphaned_resources, dry_run=True):
@@ -131,6 +155,11 @@ def cleanup_resources(orphaned_resources, dry_run=True):
             cmd = ["ip", "netns", "delete", res_name]
         elif res_type == "firewalld_interface":
             cmd = ["firewall-cmd", "--zone", resource['zone'], "--remove-interface", res_name, "--permanent"]
+        elif res_type == "nftables_rule":
+            if resource['handle'] != 'N/A':
+                cmd = ["nft", "delete", "rule", resource['table'], resource['chain'], "handle", resource['handle']]
+            else:
+                print_colored(RED, f"  -> Cannot remove rule due to missing handle: {res_name}")
 
         if cmd:
             if not dry_run:

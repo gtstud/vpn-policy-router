@@ -72,15 +72,55 @@ class VPNRouter:
         return template
 
     def _validate_config(self):
-        logger.debug("Validating configuration...")
+        logger.info("Validating configuration...")
+
+        # --- Validate vpn-definitions.json ---
         if "system_config" not in self.vpn_definitions:
             raise ValueError("Missing 'system_config' in vpn-definitions.json")
+        if "firewalld" not in self.vpn_definitions["system_config"] or "zone_vpn" not in self.vpn_definitions["system_config"]["firewalld"]:
+            raise ValueError("Missing 'firewalld.zone_vpn' in system_config")
 
-        firewalld_config = self.vpn_definitions["system_config"].get("firewalld", {})
-        if "zone_vpn" not in firewalld_config:
-            raise ValueError("Missing 'zone_vpn' in system_config.firewalld in vpn-definitions.json")
+        vpn_conns = self.vpn_definitions.get("vpn_connections", [])
+        seen_names = set()
+        seen_table_ids = set()
+        for vpn in vpn_conns:
+            if vpn['name'] in seen_names: raise ValueError(f"Duplicate VPN name found: {vpn['name']}")
+            seen_names.add(vpn['name'])
 
-        logger.debug("Configuration validation successful.")
+            if vpn['routing_table_id'] in seen_table_ids: raise ValueError(f"Duplicate routing_table_id: {vpn['routing_table_id']}")
+            seen_table_ids.add(vpn['routing_table_id'])
+
+            try:
+                ipaddress.ip_network(vpn['veth_network'])
+                ipaddress.ip_network(vpn['vpn_assigned_ip'])
+            except ValueError as e:
+                raise ValueError(f"Invalid CIDR notation in VPN '{vpn['name']}': {e}")
+
+            if "router_lan_interface" not in vpn:
+                raise ValueError(f"VPN '{vpn['name']}' is missing 'router_lan_interface' definition.")
+
+            # A simple regex for WireGuard keys (44-char Base64)
+            key_regex = re.compile(r'^[A-Za-z0-9+/]{43}=$')
+            if not key_regex.match(vpn['client_private_key']) or not key_regex.match(vpn['peer_public_key']):
+                raise ValueError(f"Invalid WireGuard key format in VPN '{vpn['name']}'")
+
+        # --- Validate vpn-clients.json ---
+        client_assignments = self.vpn_clients.get("assignments", [])
+        seen_display_names = set()
+        for client in client_assignments:
+            if client['display_name'] in seen_display_names: raise ValueError(f"Duplicate client display_name: {client['display_name']}")
+            seen_display_names.add(client['display_name'])
+
+            if not client.get('hostname') and not client.get('ip_address'):
+                raise ValueError(f"Client '{client['display_name']}' must have either a hostname or an IP address.")
+            if client.get('hostname') and client.get('ip_address'):
+                raise ValueError(f"Client '{client['display_name']}' cannot have both a hostname and an IP address.")
+
+            assigned_vpn = client.get('assigned_vpn')
+            if assigned_vpn and assigned_vpn not in seen_names:
+                raise ValueError(f"Client '{client['display_name']}' is assigned to a non-existent VPN: '{assigned_vpn}'")
+
+        logger.info("Configuration validation successful.")
 
     def _run_cmd(self, cmd, check=True):
         logger.debug(f"Running command: {' '.join(cmd)}")
@@ -184,6 +224,17 @@ class VPNRouter:
                 resolved_map.setdefault(vpn_name, []).append(ip_address)
         return resolved_map
 
+    def _wait_for_interface(self, if_name, timeout=10):
+        logger.debug(f"Waiting for interface {if_name} to appear...")
+        for _ in range(timeout):
+            result = self._run_cmd(['ip', 'link', 'show', if_name], check=False)
+            if result and result.returncode == 0:
+                logger.debug(f"Interface {if_name} found.")
+                return True
+            time.sleep(1)
+        logger.error(f"Timeout waiting for interface {if_name} to appear.")
+        return False
+
     def _apply_vpn_config(self, vpn):
         vpn_name = vpn["name"]
         ns_name = f"ns-{vpn_name}"
@@ -198,25 +249,83 @@ class VPNRouter:
         self._write_file(NETWORKD_DIR / f"30-{ns_veth}.network", f"[Match]\nName={ns_veth}\n[Network]\nAddress={ns_ip}/30")
         self._write_file(NETWORKD_DIR / f"20-{wg_if}.netdev", f"[NetDev]\nName={wg_if}\nKind=wireguard\n[WireGuard]\nPrivateKey={vpn['client_private_key']}", 0o600)
         self._write_file(NETWORKD_DIR / f"30-{wg_if}.network", f"[Match]\nName={wg_if}\n[Network]\nAddress={vpn['vpn_assigned_ip']}\nDefaultRouteOnDevice=true\n[WireGuardPeer]\nPublicKey={vpn['peer_public_key']}\nEndpoint={vpn['peer_endpoint']}\nAllowedIPs=0.0.0.0/0")
+
         self._run_cmd(["systemctl", "daemon-reload"])
         self._run_cmd(["systemctl", "enable", "--now", f"vpn-ns-{vpn_name}.service"])
         self._run_cmd(["networkctl", "reload"])
-        self._run_cmd(["ip", "link", "set", wg_if, "netns", ns_name], check=False)
-        self._run_cmd(["ip", "link", "set", ns_veth, "netns", ns_name], check=False)
-        self._run_cmd(["ip", "netns", "exec", ns_name, "systemctl", "restart", "systemd-networkd"], check=False)
 
-    def _sync_host_routing(self, resolved_clients_map):
-        logger.info("Synchronizing host policy routing...")
+        # Wait for interfaces to be created before moving them
+        if self._wait_for_interface(host_veth) and self._wait_for_interface(wg_if):
+            self._run_cmd(["ip", "link", "set", wg_if, "netns", ns_name], check=False)
+            self._run_cmd(["ip", "link", "set", ns_veth, "netns", ns_name], check=False)
+            self._run_cmd(["ip", "netns", "exec", ns_name, "systemctl", "restart", "systemd-networkd"], check=False)
+        else:
+            logger.error(f"Could not create interfaces for VPN '{vpn_name}'. Aborting configuration.")
+
+    def _sync_routing_rules(self, resolved_clients_map):
+        logger.info("Synchronizing declarative routing rules...")
+        # Group clients by the LAN interface they are on
+        clients_by_interface = {}
         for vpn_name, ips in resolved_clients_map.items():
             vpn = next((v for v in self.vpn_definitions['vpn_connections'] if v['name'] == vpn_name), None)
-            if vpn:
-                self._run_cmd(['ip', 'route', 'replace', 'default', 'dev', f"v-{vpn_name}-v", 'table', str(vpn['routing_table_id'])])
-        
-        desired_rules = {(ip, str(next(v['routing_table_id'] for v in self.vpn_definitions['vpn_connections'] if v['name'] == vpn))) for vpn, ips in resolved_clients_map.items() for ip in ips}
-        current_rules = {m.groups() for m in re.finditer(r'from\s+([0-9\.]+)\s+lookup\s+(\d+)', self._run_cmd(['ip', 'rule', 'list']).stdout)}
-        
-        for ip, table in (current_rules - desired_rules): self._run_cmd(['ip', 'rule', 'del', 'from', ip, 'lookup', table])
-        for ip, table in (desired_rules - current_rules): self._run_cmd(['ip', 'rule', 'add', 'from', ip, 'lookup', table, 'priority', '1000'])
+            if not vpn:
+                continue
+
+            lan_if = vpn.get("router_lan_interface")
+            if not lan_if:
+                logger.warning(f"VPN '{vpn_name}' does not have a 'router_lan_interface' defined. Skipping routing rule.")
+                continue
+
+            for ip in ips:
+                clients_by_interface.setdefault(lan_if, []).append({'ip': ip, 'table': vpn['routing_table_id']})
+
+        # For each LAN interface, sync the drop-in files
+        for lan_if, clients in clients_by_interface.items():
+            dropin_dir = NETWORKD_DIR / f"{lan_if}.network.d"
+
+            # Get desired state
+            desired_files = {f"10-vpn-router-{client['ip'].replace('.', '-')}.conf" for client in clients}
+
+            # Get current state
+            if dropin_dir.exists():
+                current_files = {f.name for f in dropin_dir.glob("10-vpn-router-*.conf")}
+            else:
+                current_files = set()
+
+            # Create missing drop-ins
+            for client in clients:
+                ip = client['ip']
+                table_id = client['table']
+                filename = f"10-vpn-router-{ip.replace('.', '-')}.conf"
+                if filename not in current_files:
+                    logger.info(f"Creating routing rule for {ip} via {lan_if}")
+                    content = f"[RoutingPolicyRule]\nFrom={ip}\nTable={table_id}\n"
+                    self._write_file(dropin_dir / filename, content)
+
+            # Remove orphaned drop-ins
+            for filename in (current_files - desired_files):
+                logger.info(f"Removing orphaned routing rule file: {filename}")
+                if not self.dry_run:
+                    (dropin_dir / filename).unlink()
+                self.changed_files.add("networkd_config")
+
+        # If there are no clients at all, ensure all our drop-in files are gone
+        if not resolved_clients_map:
+            for f in NETWORKD_DIR.glob("*.network.d/10-vpn-router-*.conf"):
+                logger.info(f"No active clients. Removing orphaned routing rule file: {f.name}")
+                if not self.dry_run:
+                    f.unlink()
+                self.changed_files.add("networkd_config")
+
+    def _get_nft_rule_handle(self, table, chain, rule_fragment):
+        result = self._run_cmd(['nft', '--handle', 'list', 'chain', table, chain], check=False)
+        if result and result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                if rule_fragment in line:
+                    match = re.search(r'handle\s+(\d+)', line)
+                    if match:
+                        return match.group(1)
+        return None
 
     def _get_nft_rule_handle(self, table, chain, rule_fragment):
         result = self._run_cmd(['nft', '--handle', 'list', 'chain', table, chain], check=False)
@@ -274,20 +383,37 @@ class VPNRouter:
         if "firewalld_config" in self.changed_files:
             self._run_cmd(['firewall-cmd', '--reload'])
 
+    def _cleanup_orphaned_nftables_rules(self, active_vpns):
+        logger.info("Cleaning up orphaned nftables NAT rules...")
+        config = self.vpn_definitions['system_config'].get('nftables')
+        if not config:
+            return
+
+        table, chain = config['table'], config['chain']
+        active_veth_networks = {
+            vpn['veth_network']
+            for vpn in self.vpn_definitions.get("vpn_connections", [])
+            if vpn['name'] in active_vpns
+        }
+
+        result = self._run_cmd(['nft', '--handle', 'list', 'chain', table, chain], check=False)
+        if not result or result.returncode != 0:
+            return
+
+        for line in result.stdout.strip().split('\n'):
+            match = re.search(r'ip saddr (([0-9]{1,3}\.){3}[0-9]{1,3}/\d+)', line)
+            if match:
+                rule_saddr = match.group(1)
+                if rule_saddr not in active_veth_networks:
+                    handle_match = re.search(r'handle\s+(\d+)', line)
+                    if handle_match:
+                        handle = handle_match.group(1)
+                        logger.info(f"Deleting orphaned NAT rule with source {rule_saddr} (handle: {handle})")
+                        self._run_cmd(['nft', 'delete', 'rule', table, chain, 'handle', handle])
+
     def _cleanup_vpn_resources(self, vpn_name):
         logger.info(f"Cleaning up resources for orphaned VPN '{vpn_name}'...")
         self._run_cmd(["systemctl", "disable", "--now", f"vpn-ns-{vpn_name}.service"], check=False)
-
-        # Cleanup nftables rule
-        vpn = next((v for v in self.vpn_definitions['vpn_connections'] if v['name'] == vpn_name), None)
-        if vpn:
-            config = self.vpn_definitions['system_config']['nftables']
-            table, chain = config['table'], config['chain']
-            rule_fragment = f"ip saddr {vpn['veth_network']}"
-            handle = self._get_nft_rule_handle(table, chain, rule_fragment)
-            if handle:
-                logger.info(f"Deleting NAT rule for orphaned VPN '{vpn_name}' (handle: {handle})")
-                self._run_cmd(['nft', 'delete', 'rule', table, chain, 'handle', handle])
 
         for f in self._get_vpn_resource_files(vpn_name):
             if f.exists():
@@ -331,8 +457,9 @@ class VPNRouter:
             if vpn_config:
                 self._apply_vpn_config(vpn_config)
 
-        self._sync_host_routing(resolved_clients_map)
+        self._sync_routing_rules(resolved_clients_map)
         self._sync_nftables_nat(active_vpns)
+        self._cleanup_orphaned_nftables_rules(active_vpns)
         self._sync_firewalld_zones(active_vpns, orphaned_vpns)
 
         if self.changed_files and not self.dry_run:
