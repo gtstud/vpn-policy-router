@@ -165,13 +165,42 @@ class VPNRouter:
     def _get_vpn_resource_files(self, vpn_name):
         host_veth = f"v-{vpn_name}-v"
         wg_if = f"v-{vpn_name}-w"
-        return [
+
+        files = [
             SYSTEMD_DIR / f"vpn-ns-{vpn_name}.service",
             NETWORKD_DIR / f"10-{host_veth}.netdev",
             NETWORKD_DIR / f"10-{host_veth}.network",
             NETWORKD_DIR / f"20-{wg_if}.netdev",
             NETWORKD_DIR / f"30-{wg_if}.network",
         ]
+
+        # Find associated client drop-in files
+        vpn_config = next((v for v in self.vpn_definitions['vpn_connections'] if v['name'] == vpn_name), None)
+        if not vpn_config:
+            return files
+
+        lan_if = vpn_config.get("router_lan_interface")
+        if not lan_if:
+            return files
+
+        dropin_dir = NETWORKD_DIR / f"{lan_if}.network.d"
+        if not dropin_dir.exists():
+            return files
+
+        for client in self.vpn_clients.get("assignments", []):
+            if client.get("assigned_vpn") == vpn_name:
+                ip = client.get("ip_address")
+                if not ip and client.get("hostname"):
+                    try:
+                        ip = socket.gethostbyname(client["hostname"])
+                    except socket.gaierror:
+                        continue
+
+                if ip:
+                    filename = f"10-vpn-router-{ip.replace('.', '-')}.conf"
+                    files.append(dropin_dir / filename)
+
+        return files
 
     def _is_file_manually_modified(self, file_path):
         if not file_path.exists(): return False
@@ -316,16 +345,6 @@ class VPNRouter:
                 if not self.dry_run:
                     f.unlink()
                 self.changed_files.add("networkd_config")
-
-    def _get_nft_rule_handle(self, table, chain, rule_fragment):
-        result = self._run_cmd(['nft', '--handle', 'list', 'chain', table, chain], check=False)
-        if result and result.returncode == 0:
-            for line in result.stdout.strip().split('\n'):
-                if rule_fragment in line:
-                    match = re.search(r'handle\s+(\d+)', line)
-                    if match:
-                        return match.group(1)
-        return None
 
     def _get_nft_rule_handle(self, table, chain, rule_fragment):
         result = self._run_cmd(['nft', '--handle', 'list', 'chain', table, chain], check=False)
