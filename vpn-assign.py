@@ -145,58 +145,65 @@ def find_client_by_identifier(identifier):
             
     return None
 
-
-def list_assignments():
-    """List all client VPN assignments"""
-    clients = load_json(VPN_CLIENTS_PATH)
-    vpn_defs = load_json(VPN_DEFINITIONS_PATH)
-    
-    if "assignments" not in clients or not clients["assignments"]:
-        print("No client assignments found")
-        return
+def list_vpns_and_clients() -> None:
+    """List available VPNs and client assignments"""
+    try:
+        with open(VPN_DEFINITIONS_PATH, 'r') as f:
+            vpn_defs = json.load(f)
+            
+        with open(VPN_CLIENTS_PATH, 'r') as f:
+            client_assignments = json.load(f)
+            
+        # Print available VPNs
+        print("\n=== Available VPN Connections ===")
+        print(f"{'Name':<15} {'Description':<30}")
+        print("-" * 45)
         
-    # Get a mapping of VPN names for display
-    vpn_names = {}
-    if "vpn_connections" in vpn_defs:
-        for vpn in vpn_defs["vpn_connections"]:
-            if "name" in vpn:
-                vpn_names[vpn["name"]] = vpn
-    
-    # Print header
-    print("\nCurrent VPN Assignments:")
-    print("-" * 100)
-    print(f"{'Display Name':<25} {'Hostname':<20} {'IP Address':<16} {'VPN':<15} {'Expiry':<30}")
-    print("-" * 100)
-    
-    # Sort assignments by expiry (permanent ones last)
-    def get_expiry_key(a):
-        expiry = a.get("assignment_expiry")
-        if not expiry:
-            return float('inf')
-        if isinstance(expiry, str):
-            try:
-                return datetime.fromisoformat(expiry.replace('Z', '+00:00')).timestamp()
-            except:
-                return float('inf')
-        return expiry
+        for vpn in vpn_defs.get("vpn_connections", []):
+            print(f"{vpn.get('name', 'N/A'):<15} {vpn.get('description', 'N/A'):<30}")
         
-    sorted_assignments = sorted(
-        clients["assignments"],
-        key=get_expiry_key
-    )
-    
-    # Print each assignment
-    for assignment in sorted_assignments:
-        display_name = assignment.get("display_name", "")
-        hostname = assignment.get("hostname", "") or ""
-        ip_address = assignment.get("ip_address", "") or ""
-        vpn_name = assignment.get("assigned_vpn", "direct")
-        expiry = format_expiry(assignment.get("assignment_expiry"))
+        # Print client assignments
+        print("\n=== Client Assignments ===")
+        print(f"{'Display Name':<20} {'Identifier':<20} {'Assigned VPN':<15} {'Expires':<25}")
+        print("-" * 80)
         
-        print(f"{display_name:<25} {hostname:<20} {ip_address:<16} {vpn_name:<15} {expiry:<30}")
+        now = datetime.now(timezone.utc)
+        
+        for client in client_assignments.get("assignments", []):
+            # Determine the identifier (hostname or IP)
+            identifier = client.get("hostname") or client.get("ip_address") or "N/A"
+            
+            # Determine expiry
+            expiry = client.get("assignment_expiry")
+            if expiry:
+                try:
+                    expiry_date = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+                    if expiry_date < now:
+                        expiry_display = f"{expiry} (EXPIRED)"
+                    else:
+                        time_left = expiry_date - now
+                        days_left = time_left.days
+                        expiry_display = f"{expiry} ({days_left} days left)"
+                except ValueError:
+                    expiry_display = f"{expiry} (INVALID FORMAT)"
+            else:
+                expiry_display = "Never"
+                
+            # Display with color if expired
+            if expiry and "EXPIRED" in expiry_display:
+                print(f"{client.get('display_name', 'N/A'):<20} {identifier:<20} {client.get('assigned_vpn', 'N/A'):<15} \033[0;31m{expiry_display}\033[0m")
+            else:
+                print(f"{client.get('display_name', 'N/A'):<20} {identifier:<20} {client.get('assigned_vpn', 'N/A'):<15} {expiry_display:<25}")
     
-    print("-" * 100)
-
+    except FileNotFoundError as e:
+        print(f"Error: Configuration file not found - {e}")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in configuration file - {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error listing VPNs and clients: {e}")
+        sys.exit(1)
 
 def create_assignment(ip_address, hostname, vpn_name, expiry=None, display_name=None):
     """Create a new VPN assignment for a client"""
@@ -515,7 +522,7 @@ def main():
     
     # Handle management actions
     if args.list:
-        list_assignments()
+        list_vpns_and_clients()
         return
         
     if args.cleanup_expired:

@@ -76,7 +76,6 @@ def get_active_vpns():
             
     return active_vpns
 
-
 def check_network_namespaces(active_vpns):
     """Check for orphaned network namespaces"""
     print_colored(GREEN, "Checking network namespaces...")
@@ -108,366 +107,244 @@ def check_network_namespaces(active_vpns):
     except Exception as e:
         print_colored(RED, f"Error checking network namespaces: {e}")
         
-    if not orphaned_ns:
-        print_colored(GREEN, "No orphaned namespaces found")
-        
     return orphaned_ns
-
-
-def check_network_interfaces(active_vpns, network_prefix):
-    """Check for orphaned network interfaces"""
-    print_colored(GREEN, "Checking network interfaces...")
-    orphaned_interfaces = []
-    
-    try:
-        # Check by name pattern
-        if_output = subprocess.run(["ip", "link", "show"], 
-                                  capture_output=True, text=True).stdout
-        
-        if_pattern = re.compile(r"\d+:\s+(v-([a-zA-Z0-9_-]+)-[wvp])[@:]")
-        
-        for line in if_output.splitlines():
-            match = if_pattern.search(line)
-            if match:
-                if_name = match.group(1)
-                vpn_name = match.group(2)
-                
-                # Check if VPN is active
-                if vpn_name not in active_vpns:
-                    print_colored(YELLOW, f"Found orphaned interface by name: {if_name}")
-                    orphaned_interfaces.append({
-                        "name": if_name,
-                        "vpn_name": vpn_name,
-                        "detection_method": "name_pattern"
-                    })
-        
-        # Check by IP range
-        addr_output = subprocess.run(["ip", "addr", "show"], 
-                                   capture_output=True, text=True).stdout
-        
-        ip_pattern = re.compile(rf"inet ({network_prefix}\.\d+\.\d+)/\d+.+\s(\S+)$", re.MULTILINE)
-        
-        for match in ip_pattern.finditer(addr_output):
-            ip_addr = match.group(1)
-            if_name = match.group(2)
-            
-            # Skip interfaces already found by name pattern
-            if any(iface["name"] == if_name for iface in orphaned_interfaces):
-                continue
-            
-            # Skip interfaces that match our naming pattern but are in active VPNs
-            if_pattern = re.compile(r"v-([a-zA-Z0-9_-]+)-[wvp]")
-            name_match = if_pattern.match(if_name)
-            if name_match:
-                vpn_name = name_match.group(1)
-                if vpn_name in active_vpns:
-                    continue
-            
-            print_colored(YELLOW, f"Found interface with IP in our range: {if_name} ({ip_addr})")
-            orphaned_interfaces.append({
-                "name": if_name,
-                "ip": ip_addr,
-                "detection_method": "ip_range"
-            })
-            
-    except Exception as e:
-        print_colored(RED, f"Error checking network interfaces: {e}")
-        
-    if not orphaned_interfaces:
-        print_colored(GREEN, "No orphaned interfaces found")
-        
-    return orphaned_interfaces
-
 
 def check_routing_tables(active_vpns, min_table_id, max_table_id):
     """Check for orphaned routing tables"""
     print_colored(GREEN, "Checking routing tables...")
     orphaned_tables = []
     
-    # Get all active table IDs
-    active_table_ids = set()
-    if VPN_DEFINITIONS_PATH.exists():
-        try:
-            with open(VPN_DEFINITIONS_PATH, 'r') as f:
-                config = json.load(f)
-                
-            active_table_ids = {int(vpn["routing_table_id"]) for vpn in config.get("vpn_connections", [])
-                               if "routing_table_id" in vpn and vpn["routing_table_id"].isdigit()}
-        except Exception as e:
-            print_colored(RED, f"Error loading VPN definitions: {e}")
-    
-    # Check routing table files
     try:
-        # Check rt_tables.d first
-        rt_tables_d_path = Path("/etc/iproute2/rt_tables.d")
-        if rt_tables_d_path.exists():
-            for file_path in rt_tables_d_path.glob("*.conf"):
-                try:
-                    with open(file_path, 'r') as f:
-                        content = f.read()
+        # Get all routing tables from /etc/iproute2/rt_tables
+        rt_tables = {}
+        if os.path.exists("/etc/iproute2/rt_tables"):
+            with open("/etc/iproute2/rt_tables", 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
                     
-                    # Extract table ID
-                    match = re.match(r"^\s*(\d+)\s+(\S+)", content)
-                    if match:
-                        table_id = int(match.group(1))
-                        table_name = match.group(2)
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        table_id = int(parts[0])
+                        table_name = parts[1]
                         
-                        if (min_table_id <= table_id <= max_table_id and 
-                            table_id not in active_table_ids):
-                            
-                            # Extract VPN name from file name if possible
-                            file_name = file_path.name
-                            vpn_name = None
-                            if "_" in file_name:
-                                vpn_name = file_name.split("_")[0]
-                                
-                            print_colored(YELLOW, f"Found orphaned routing table: {table_id} ({table_name}) in {file_path}")
-                            orphaned_tables.append({
-                                "id": table_id,
-                                "name": table_name,
-                                "path": str(file_path),
-                                "vpn_name": vpn_name
-                            })
-                except Exception as e:
-                    print_colored(RED, f"Error processing file {file_path}: {e}")
+                        if min_table_id <= table_id <= max_table_id:
+                            # Extract VPN name from table name (if follows our pattern)
+                            if table_name.endswith("_tbl"):
+                                vpn_name = table_name[:-4]  # Remove "_tbl" suffix
+                                if vpn_name not in active_vpns:
+                                    print_colored(YELLOW, f"Found orphaned routing table: {table_id} ({table_name})")
+                                    orphaned_tables.append({
+                                        "id": table_id,
+                                        "name": table_name,
+                                        "vpn_name": vpn_name
+                                    })
         
-        # Check main rt_tables file
-        rt_tables_path = Path("/etc/iproute2/rt_tables")
-        if rt_tables_path.exists():
-            try:
-                with open(rt_tables_path, 'r') as f:
-                    content = f.read()
+        # Check for tables that might not be in the rt_tables file
+        ip_rule_output = subprocess.run(["ip", "rule", "show"], 
+                                    capture_output=True, text=True).stdout
+                                    
+        for line in ip_rule_output.splitlines():
+            match = re.search(r'lookup (\d+)', line)
+            if match:
+                table_id = int(match.group(1))
+                if min_table_id <= table_id <= max_table_id:
+                    vpn_found = False
+                    for vpn_name in active_vpns:
+                        # Check if table is referenced in active VPNs
+                        if f"_{vpn_name}" in line or f"{vpn_name}_" in line:
+                            vpn_found = True
+                            break
                     
-                for line in content.splitlines():
-                    if line.strip() and not line.strip().startswith("#"):
-                        # Extract table ID and name
-                        match = re.match(r"^\s*(\d+)\s+(\S+)", line)
-                        if match:
-                            table_id = int(match.group(1))
-                            table_name = match.group(2)
-                            
-                            if (min_table_id <= table_id <= max_table_id and 
-                                table_id not in active_table_ids and
-                                not any(table["id"] == table_id for table in orphaned_tables)):
-                                
-                                print_colored(YELLOW, f"Found orphaned routing table in main rt_tables: {table_id} ({table_name})")
-                                orphaned_tables.append({
-                                    "id": table_id,
-                                    "name": table_name,
-                                    "path": str(rt_tables_path),
-                                    "vpn_name": None
-                                })
-            except Exception as e:
-                print_colored(RED, f"Error processing main rt_tables file: {e}")
-                
+                    if not vpn_found and not any(t["id"] == table_id for t in orphaned_tables):
+                        print_colored(YELLOW, f"Found orphaned routing rule for table: {table_id}")
+                        orphaned_tables.append({
+                            "id": table_id,
+                            "name": f"unknown_{table_id}",
+                            "vpn_name": "unknown"
+                        })
+        
     except Exception as e:
         print_colored(RED, f"Error checking routing tables: {e}")
-        
-    if not orphaned_tables:
-        print_colored(GREEN, "No orphaned routing tables found")
-        
+    
     return orphaned_tables
 
-
-def check_routing_rules(active_vpns, min_table_id, max_table_id):
-    """Check for orphaned routing rules"""
-    print_colored(GREEN, "Checking routing rules...")
-    orphaned_rules = []
+def check_veth_interfaces(active_vpns):
+    """Check for orphaned veth interfaces"""
+    print_colored(GREEN, "Checking veth interfaces...")
+    orphaned_veths = []
     
-    # Get all active table IDs
-    active_table_ids = set()
-    if VPN_DEFINITIONS_PATH.exists():
-        try:
-            with open(VPN_DEFINITIONS_PATH, 'r') as f:
-                config = json.load(f)
-                
-            active_table_ids = {int(vpn["routing_table_id"]) for vpn in config.get("vpn_connections", [])
-                               if "routing_table_id" in vpn and vpn["routing_table_id"].isdigit()}
-        except Exception as e:
-            print_colored(RED, f"Error loading VPN definitions: {e}")
-    
-    # Check IP rules
     try:
-        rules_output = subprocess.run(["ip", "rule", "list"], 
-                                     capture_output=True, text=True).stdout
-        
-        for line in rules_output.splitlines():
-            if "lookup" in line:
-                parts = line.split("lookup")
-                if len(parts) >= 2:
-                    table_ref = parts[1].strip()
+        ip_link_output = subprocess.run(["ip", "link", "show"], 
+                                      capture_output=True, text=True).stdout
+                                      
+        for line in ip_link_output.splitlines():
+            if "veth-" in line:
+                match = re.search(r'\d+: (veth-\w+)[@:]', line)
+                if match:
+                    veth_name = match.group(1)
+                    vpn_name = veth_name[5:]  # Remove "veth-" prefix
                     
-                    if table_ref.isdigit():
-                        table_id = int(table_ref)
-                        
-                        if (min_table_id <= table_id <= max_table_id and 
-                            table_id not in active_table_ids):
-                            
-                            # Extract from clause if exists
-                            from_match = re.search(r"from\s+([0-9./]+)", line)
-                            from_ip = from_match.group(1) if from_match else None
-                            
-                            # Extract priority
-                            priority_match = re.search(r"^(\d+):", line)
-                            priority = priority_match.group(1) if priority_match else None
-                            
-                            print_colored(YELLOW, f"Found orphaned routing rule: {line}")
-                            orphaned_rules.append({
-                                "rule": line,
-                                "table_id": table_id,
-                                "from_ip": from_ip,
-                                "priority": priority
-                            })
+                    if vpn_name not in active_vpns:
+                        print_colored(YELLOW, f"Found orphaned veth interface: {veth_name}")
+                        orphaned_veths.append({
+                            "name": veth_name,
+                            "vpn_name": vpn_name
+                        })
+    
     except Exception as e:
-        print_colored(RED, f"Error checking routing rules: {e}")
-        
-    if not orphaned_rules:
-        print_colored(GREEN, "No orphaned routing rules found")
-        
-    return orphaned_rules
+        print_colored(RED, f"Error checking veth interfaces: {e}")
+    
+    return orphaned_veths
 
-
-def check_systemd_files(active_vpns):
-    """Check for orphaned systemd files"""
-    print_colored(GREEN, "Checking systemd files...")
+def check_network_files(active_vpns):
+    """Check for orphaned network configuration files"""
+    print_colored(GREEN, "Checking network configuration files...")
     orphaned_files = []
     
-    # Check service files
     try:
-        for service_path in Path("/etc/systemd/system").glob("vpn-ns-*.service"):
-            vpn_name = service_path.name.split("vpn-ns-")[1].split(".")[0]
-            
-            if vpn_name not in active_vpns:
-                print_colored(YELLOW, f"Found orphaned service file: {service_path}")
-                orphaned_files.append({
-                    "type": "service",
-                    "path": str(service_path),
-                    "vpn_name": vpn_name
-                })
-    except Exception as e:
-        print_colored(RED, f"Error checking service files: {e}")
+        if NETWORKD_PATH.exists():
+            for file_path in NETWORKD_PATH.glob("*.network"):
+                file_name = file_path.name
+                if file_name.startswith("vpn-"):
+                    # Extract VPN name
+                    vpn_name = file_name[4:].split('.')[0]  # Remove "vpn-" prefix and extension
+                    
+                    if vpn_name not in active_vpns:
+                        print_colored(YELLOW, f"Found orphaned network file: {file_name}")
+                        orphaned_files.append({
+                            "path": str(file_path),
+                            "name": file_name,
+                            "vpn_name": vpn_name
+                        })
     
-    # Check networkd files
-    try:
-        patterns = ["10-v-*-*.netdev", "10-v-*-*.network", "20-v-*-*.netdev", "20-v-*-*.network", "50-*-client-*.network"]
-        
-        for pattern in patterns:
-            for file_path in NETWORKD_PATH.glob(pattern):
-                # Extract VPN name
-                if "-v-" in file_path.name:
-                    # Format v-{vpn_name}-* for veth and wireguard devices
-                    name_parts = file_path.name.split("-v-")
-                    if len(name_parts) > 1:
-                        vpn_parts = name_parts[1].split("-", 1)
-                        if len(vpn_parts) > 1:
-                            vpn_name = vpn_parts[0]
-                            
-                            if vpn_name not in active_vpns:
-                                print_colored(YELLOW, f"Found orphaned networkd file: {file_path}")
-                                orphaned_files.append({
-                                    "type": "networkd",
-                                    "path": str(file_path),
-                                    "vpn_name": vpn_name
-                                })
-                elif "client-" in file_path.name:
-                    # Format 50-{vpn_name}-client-*
-                    name_parts = file_path.name.split("-client-")
-                    if len(name_parts) > 1:
-                        vpn_parts = name_parts[0].split("-", 1)
-                        if len(vpn_parts) > 1:
-                            vpn_name = vpn_parts[1]
-                            
-                            if vpn_name not in active_vpns:
-                                print_colored(YELLOW, f"Found orphaned client rule file: {file_path}")
-                                orphaned_files.append({
-                                    "type": "networkd_rule",
-                                    "path": str(file_path),
-                                    "vpn_name": vpn_name
-                                })
     except Exception as e:
-        print_colored(RED, f"Error checking networkd files: {e}")
+        print_colored(RED, f"Error checking network files: {e}")
     
-    if not orphaned_files:
-        print_colored(GREEN, "No orphaned systemd files found")
-        
     return orphaned_files
 
-
-def print_summary(all_orphaned_resources):
-    """Print a summary of all orphaned resources"""
-    print("\n" + "="*60)
-    print_colored(GREEN, "ORPHANED RESOURCES SUMMARY:")
+def cleanup_resources(orphaned_namespaces, orphaned_tables, orphaned_veths, orphaned_files, dry_run=True):
+    """Clean up orphaned resources"""
+    if dry_run:
+        print_colored(YELLOW, "DRY RUN MODE - No changes will be made")
     
-    total_resources = sum(len(resources) for resources in all_orphaned_resources.values())
-    
-    if total_resources == 0:
-        print_colored(GREEN, "No orphaned resources found. System is clean.")
+    # Count total resources to clean up
+    total = len(orphaned_namespaces) + len(orphaned_tables) + len(orphaned_veths) + len(orphaned_files)
+    if total == 0:
+        print_colored(GREEN, "No orphaned resources found to clean up")
         return
+        
+    print_colored(GREEN, f"Preparing to clean up {total} orphaned resources")
     
-    print_colored(YELLOW, f"Found {total_resources} total orphaned resources:")
+    # Clean up network namespaces
+    for ns in orphaned_namespaces:
+        cmd = ["ip", "netns", "delete", ns["name"]]
+        print_colored(YELLOW, f"{'Would execute' if dry_run else 'Executing'}: {' '.join(cmd)}")
+        if not dry_run:
+            try:
+                subprocess.run(cmd, check=True)
+                print_colored(GREEN, f"Successfully removed namespace: {ns['name']}")
+            except subprocess.CalledProcessError as e:
+                print_colored(RED, f"Failed to remove namespace {ns['name']}: {e}")
     
-    for resource_type, resources in all_orphaned_resources.items():
-        if resources:
-            print_colored(YELLOW, f"- {resource_type}: {len(resources)}")
-            
-    print("\nTo clean up these resources, run:")
-    print_colored(GREEN, "  sudo /usr/local/bin/vpn-apply.py --clean-orphaned")
-
+    # Clean up routing tables (rules)
+    for table in orphaned_tables:
+        # Get rules for this table
+        try:
+            rules_output = subprocess.run(["ip", "rule", "show", "table", str(table["id"])], 
+                                      capture_output=True, text=True).stdout
+                                      
+            for line in rules_output.splitlines():
+                if f"lookup {table['id']}" in line:
+                    # Extract rule priority and selector
+                    match = re.search(r'^(\d+):\s+(.+)\s+lookup\s+\d+', line)
+                    if match:
+                        priority = match.group(1)
+                        selector = match.group(2).strip()
+                        
+                        cmd = ["ip", "rule", "del", "prio", priority]
+                        if selector != "from all":
+                            cmd.extend(selector.split())
+                            
+                        print_colored(YELLOW, f"{'Would execute' if dry_run else 'Executing'}: {' '.join(cmd)}")
+                        if not dry_run:
+                            try:
+                                subprocess.run(cmd, check=True)
+                                print_colored(GREEN, f"Successfully removed rule for table: {table['id']}")
+                            except subprocess.CalledProcessError as e:
+                                print_colored(RED, f"Failed to remove rule for table {table['id']}: {e}")
+        
+        except Exception as e:
+            print_colored(RED, f"Error getting rules for table {table['id']}: {e}")
+    
+    # Clean up veth interfaces
+    for veth in orphaned_veths:
+        cmd = ["ip", "link", "delete", veth["name"]]
+        print_colored(YELLOW, f"{'Would execute' if dry_run else 'Executing'}: {' '.join(cmd)}")
+        if not dry_run:
+            try:
+                subprocess.run(cmd, check=True)
+                print_colored(GREEN, f"Successfully removed veth interface: {veth['name']}")
+            except subprocess.CalledProcessError as e:
+                print_colored(RED, f"Failed to remove veth interface {veth['name']}: {e}")
+    
+    # Clean up network files
+    for file in orphaned_files:
+        print_colored(YELLOW, f"{'Would remove' if dry_run else 'Removing'} network file: {file['path']}")
+        if not dry_run:
+            try:
+                os.remove(file['path'])
+                print_colored(GREEN, f"Successfully removed network file: {file['name']}")
+            except OSError as e:
+                print_colored(RED, f"Failed to remove network file {file['name']}: {e}")
 
 def main():
     """Main function"""
-    parser = argparse.ArgumentParser(description="VPN Router Resource Check Script")
-    parser.add_argument("--json", action="store_true", help="Output results as JSON")
+    parser = argparse.ArgumentParser(description="Check for orphaned VPN router resources")
+    parser.add_argument("--clean", action="store_true", help="Clean up orphaned resources")
+    parser.add_argument("--force", action="store_true", help="Don't ask for confirmation when cleaning")
     args = parser.parse_args()
     
-    # Check if running as root
-    if os.geteuid() != 0:
-        print_colored(RED, "This script must be run as root")
-        sys.exit(1)
-        
     # Load configuration ranges
     min_table_id, max_table_id, network_prefix = load_config_ranges()
+    print_colored(GREEN, f"Using resource ranges: Tables {min_table_id}-{max_table_id}, Network {network_prefix}.*.*")
     
     # Get active VPNs
     active_vpns = get_active_vpns()
-    
-    print_colored(GREEN, f"Using routing table ID range: {min_table_id}-{max_table_id}")
-    print_colored(GREEN, f"Using network prefix: {network_prefix}")
     print_colored(GREEN, f"Found {len(active_vpns)} active VPNs: {', '.join(active_vpns) if active_vpns else 'none'}")
-    print("")
     
     # Check for orphaned resources
     orphaned_namespaces = check_network_namespaces(active_vpns)
-    print("")
-    
-    orphaned_interfaces = check_network_interfaces(active_vpns, network_prefix)
-    print("")
-    
     orphaned_tables = check_routing_tables(active_vpns, min_table_id, max_table_id)
-    print("")
+    orphaned_veths = check_veth_interfaces(active_vpns)
+    orphaned_files = check_network_files(active_vpns)
     
-    orphaned_rules = check_routing_rules(active_vpns, min_table_id, max_table_id)
-    print("")
+    # Summary
+    total_orphaned = len(orphaned_namespaces) + len(orphaned_tables) + len(orphaned_veths) + len(orphaned_files)
+    print_colored(GREEN, f"\nOrphaned resource summary:")
+    print_colored(GREEN, f"- Network namespaces: {len(orphaned_namespaces)}")
+    print_colored(GREEN, f"- Routing tables: {len(orphaned_tables)}")
+    print_colored(GREEN, f"- Veth interfaces: {len(orphaned_veths)}")
+    print_colored(GREEN, f"- Network files: {len(orphaned_files)}")
     
-    orphaned_files = check_systemd_files(active_vpns)
-    print("")
-    
-    # Organize results
-    all_orphaned_resources = {
-        "network_namespaces": orphaned_namespaces,
-        "network_interfaces": orphaned_interfaces,
-        "routing_tables": orphaned_tables,
-        "routing_rules": orphaned_rules,
-        "systemd_files": orphaned_files
-    }
-    
-    if args.json:
-        # Output as JSON
-        print(json.dumps(all_orphaned_resources, indent=2))
+    # Clean up if requested
+    if args.clean and total_orphaned > 0:
+        if args.force:
+            print_colored(YELLOW, "Automatic cleanup requested with --force")
+            cleanup_resources(orphaned_namespaces, orphaned_tables, orphaned_veths, orphaned_files, dry_run=False)
+        else:
+            print_colored(YELLOW, "")
+            answer = input("Clean up these orphaned resources? (y/N): ").strip().lower()
+            if answer == 'y':
+                cleanup_resources(orphaned_namespaces, orphaned_tables, orphaned_veths, orphaned_files, dry_run=False)
+            else:
+                print_colored(YELLOW, "Cleanup cancelled")
+    elif args.clean:
+        print_colored(GREEN, "No orphaned resources to clean up")
     else:
-        # Print summary
-        print_summary(all_orphaned_resources)
-    
+        if total_orphaned > 0:
+            print_colored(YELLOW, "Run with --clean to clean up these resources")
 
 if __name__ == "__main__":
     main()

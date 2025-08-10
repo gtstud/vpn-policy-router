@@ -92,22 +92,92 @@ class VPNRouter:
         self._validate_config()
         
     def _load_json(self, path):
-        """Load JSON from file"""
+        """Load JSON from file with improved error handling"""
         try:
             if path.exists():
                 with open(path, 'r') as f:
                     return json.load(f)
             else:
                 logger.warning(f"Config file not found: {path}")
-                return {}
-        except json.JSONDecodeError:
-            logger.error(f"Invalid JSON in {path}")
+                # Create an empty template file instead of just returning empty dict
+                if path == VPN_DEFINITIONS_PATH:
+                    template = {
+                        "system_config": {
+                            "routing_table_id_range": {
+                                "min": DEFAULT_MIN_TABLE_ID,
+                                "max": DEFAULT_MAX_TABLE_ID
+                            },
+                            "veth_network_range": {
+                                "prefix": DEFAULT_NETWORK_PREFIX
+                            }
+                        },
+                        "vpn_connections": []
+                    }
+                elif path == VPN_CLIENTS_PATH:
+                    template = {
+                        "assignments": []
+                    }
+                else:
+                    template = {}
+                    
+                # In auto mode, create the template file
+                if self.auto_mode:
+                    logger.info(f"Creating template config file at {path}")
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, 'w') as f:
+                        json.dump(template, f, indent=2)
+                return template
+                
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in {path}: {e}")
             if self.auto_mode:
-                logger.error("Exiting due to invalid configuration")
-                sys.exit(1)
+                # Try to repair common JSON errors
+                logger.info("Attempting to repair JSON file...")
+                try:
+                    with open(path, 'r') as f:
+                        content = f.read()
+                    
+                    # Backup the original file
+                    backup_path = f"{path}.bak.{int(time.time())}"
+                    with open(backup_path, 'w') as f:
+                        f.write(content)
+                    logger.info(f"Original file backed up to {backup_path}")
+                    
+                    # Try to fix common JSON errors
+                    content = re.sub(r',\s*}', '}', content)  # Remove trailing commas
+                    content = re.sub(r',\s*]', ']', content)  # Remove trailing commas in arrays
+                    
+                    # Try to parse the fixed content
+                    fixed_data = json.loads(content)
+                    
+                    # Write back the corrected JSON
+                    with open(path, 'w') as f:
+                        json.dump(fixed_data, f, indent=2)
+                    logger.info(f"JSON file repaired successfully")
+                    return fixed_data
+                except Exception as repair_error:
+                    logger.error(f"Failed to repair JSON: {repair_error}")
+                    logger.error("Exiting due to invalid configuration")
+                    sys.exit(1)
             else:
                 if self._prompt_yes_no(f"Config file {path} contains invalid JSON. Continue with empty config?"):
-                    return {}
+                    if path == VPN_DEFINITIONS_PATH:
+                        return {
+                            "system_config": {
+                                "routing_table_id_range": {
+                                    "min": DEFAULT_MIN_TABLE_ID,
+                                    "max": DEFAULT_MAX_TABLE_ID
+                                },
+                                "veth_network_range": {
+                                    "prefix": DEFAULT_NETWORK_PREFIX
+                                }
+                            },
+                            "vpn_connections": []
+                        }
+                    elif path == VPN_CLIENTS_PATH:
+                        return {"assignments": []}
+                    else:
+                        return {}
                 else:
                     logger.error("Exiting due to invalid configuration")
                     sys.exit(1)
@@ -118,148 +188,170 @@ class VPNRouter:
                 sys.exit(1)
             else:
                 if self._prompt_yes_no(f"Error loading config file {path}. Continue with empty config?"):
-                    return {}
+                    if path == VPN_DEFINITIONS_PATH:
+                        return {
+                            "system_config": {
+                                "routing_table_id_range": {
+                                    "min": DEFAULT_MIN_TABLE_ID,
+                                    "max": DEFAULT_MAX_TABLE_ID
+                                },
+                                "veth_network_range": {
+                                    "prefix": DEFAULT_NETWORK_PREFIX
+                                }
+                            },
+                            "vpn_connections": []
+                        }
+                    elif path == VPN_CLIENTS_PATH:
+                        return {"assignments": []}
+                    else:
+                        return {}
                 else:
                     logger.error("Exiting due to configuration error")
                     sys.exit(1)
-                    
+    
     def _validate_config(self):
-        """Validate configuration for required fields and formats"""
-        # Validate system_config
+        """Validate the configuration files"""
+        # Check if system_config exists
         if "system_config" not in self.vpn_definitions:
             logger.error("Missing 'system_config' in vpn-definitions.json")
             sys.exit(1)
-            
-        system_config = self.vpn_definitions["system_config"]
         
-        # Validate routing_table_id_range
-        if "routing_table_id_range" not in system_config:
-            logger.error("Missing 'routing_table_id_range' in system_config")
-            sys.exit(1)
-            
-        table_range = system_config["routing_table_id_range"]
-        if "min" not in table_range or "max" not in table_range:
-            logger.error("Missing 'min' or 'max' in routing_table_id_range")
-            sys.exit(1)
-            
-        # Validate veth_network_range
-        if "veth_network_range" not in system_config:
-            logger.error("Missing 'veth_network_range' in system_config")
-            sys.exit(1)
-            
-        network_range = system_config["veth_network_range"]
-        if "prefix" not in network_range:
-            logger.error("Missing 'prefix' in veth_network_range")
-            sys.exit(1)
-            
-        # Get network prefix for validation
-        network_prefix = network_range["prefix"]
-        
-        # Validate VPN connections
+        # Check for VPN connections
         if "vpn_connections" not in self.vpn_definitions:
             logger.error("Missing 'vpn_connections' in vpn-definitions.json")
             sys.exit(1)
             
-        for i, vpn in enumerate(self.vpn_definitions["vpn_connections"]):
-            if "name" not in vpn:
-                logger.error(f"Missing 'name' in VPN connection at index {i}")
-                sys.exit(1)
-                
-            if "routing_table_id" not in vpn:
-                logger.error(f"Missing 'routing_table_id' in VPN connection {vpn['name']}")
-                sys.exit(1)
-                
-            if "veth_network" not in vpn:
-                logger.error(f"Missing 'veth_network' in VPN connection {vpn['name']}")
-                sys.exit(1)
-                
-            # Check for duplicate names
-            vpn_names = [v["name"] for v in self.vpn_definitions["vpn_connections"]]
-            if vpn_names.count(vpn["name"]) > 1:
-                logger.error(f"Duplicate VPN name found: {vpn['name']}")
-                sys.exit(1)
-                
-            # Check for duplicate routing table IDs
-            table_ids = [v["routing_table_id"] for v in self.vpn_definitions["vpn_connections"]]
-            if table_ids.count(vpn["routing_table_id"]) > 1:
-                logger.error(f"Duplicate routing table ID found: {vpn['routing_table_id']}")
-                sys.exit(1)
-                
-            # Check for duplicate veth networks
-            veth_networks = [v["veth_network"] for v in self.vpn_definitions["vpn_connections"]]
-            if veth_networks.count(vpn["veth_network"]) > 1:
-                logger.error(f"Duplicate veth network found: {vpn['veth_network']}")
-                sys.exit(1)
-                
-            # Validate veth network format
-            try:
-                # Check if it's a valid CIDR subnet
-                veth_net = vpn["veth_network"]
-                
-                # If it's just a number, assume it's the third octet for a /30 subnet
-                if isinstance(veth_net, (int, str)) and str(veth_net).isdigit():
-                    third_octet = int(veth_net)
-                    if third_octet < 0 or third_octet > 255:
-                        logger.error(f"Invalid veth network number in {vpn['name']}: {veth_net}")
-                        logger.error("Network number should be between 0-255")
-                        sys.exit(1)
-                        
-                    # Construct the proper network with prefix
-                    full_network = f"{network_prefix}.{third_octet}.0/30"
-                    
-                    # Update the configuration with the proper CIDR format
-                    vpn["veth_network"] = full_network
-                else:
-                    # If it's already a string with CIDR notation, validate it
-                    try:
-                        network = ipaddress.IPv4Network(veth_net)
-                        
-                        # Check if it uses the correct prefix
-                        network_parts = str(network.network_address).split('.')
-                        expected_prefix = network_prefix.split('.')
-                        
-                        if len(network_parts) >= len(expected_prefix):
-                            for i, part in enumerate(expected_prefix):
-                                if network_parts[i] != part:
-                                    logger.error(f"Invalid network prefix in {vpn['name']}: {veth_net}")
-                                    logger.error(f"Expected prefix {network_prefix} does not match {'.'.join(network_parts[:len(expected_prefix)])}")
-                                    sys.exit(1)
-                    except ValueError:
-                        logger.error(f"Invalid veth network format in {vpn['name']}: {veth_net}")
-                        logger.error("Network should be in CIDR format (e.g., 10.239.1.0/30)")
-                        sys.exit(1)
-            except Exception as e:
-                logger.error(f"Error validating veth network in {vpn['name']}: {e}")
-                logger.error("Network should be either a number between 0-255 or a valid CIDR subnet")
-                sys.exit(1)
-                
-        # Validate client assignments
-        if "assignments" not in self.vpn_clients:
-            logger.error("Missing 'assignments' in vpn-clients.json")
+        # Check routing table ID range
+        routing_range = self.vpn_definitions["system_config"].get("routing_table_id_range", {})
+        min_table_id = routing_range.get("min", DEFAULT_MIN_TABLE_ID)
+        max_table_id = routing_range.get("max", DEFAULT_MAX_TABLE_ID)
+        
+        if not isinstance(min_table_id, int) or not isinstance(max_table_id, int):
+            logger.error("Invalid routing table ID range: must be integers")
+            sys.exit(1)
+        
+        if min_table_id >= max_table_id:
+            logger.error("Invalid routing table ID range: min must be less than max")
             sys.exit(1)
             
-        valid_vpn_names = set(vpn["name"] for vpn in self.vpn_definitions["vpn_connections"])
+        if min_table_id < 1 or max_table_id > 65535:
+            logger.error("Invalid routing table ID range: values must be between 1 and 65535")
+            sys.exit(1)
         
-        for i, assignment in enumerate(self.vpn_clients["assignments"]):
-            if "client_id" not in assignment:
-                logger.error(f"Missing 'client_id' in assignment at index {i}")
+        # Check network prefix
+        network_config = self.vpn_definitions["system_config"].get("veth_network_range", {})
+        network_prefix = network_config.get("prefix", DEFAULT_NETWORK_PREFIX)
+        
+        if not isinstance(network_prefix, str) or not re.match(r'^(\d{1,3})\.(\d{1,3})$', network_prefix):
+            logger.error("Invalid network prefix: must be in format X.Y")
+            sys.exit(1)
+            
+        # Validate each VPN connection
+        used_table_ids = set()
+        used_networks = set()
+        used_names = set()
+        
+        for vpn in self.vpn_definitions["vpn_connections"]:
+            # Check required fields
+            required_fields = [
+                "name", "client_private_key", "client_public_key", 
+                "peer_public_key", "peer_endpoint", "vpn_assigned_ip",
+                "veth_network", "routing_table_id"
+            ]
+            
+            for field in required_fields:
+                if field not in vpn:
+                    logger.error(f"Missing required field '{field}' in VPN connection")
+                    sys.exit(1)
+            
+            # Validate name (alphanumeric, no spaces)
+            if not re.match(r'^[a-zA-Z0-9_-]+$', vpn["name"]):
+                logger.error(f"Invalid VPN name: {vpn['name']} (must contain only alphanumeric, underscore, hyphen)")
                 sys.exit(1)
                 
-            if "vpn" not in assignment:
-                logger.error(f"Missing 'vpn' in assignment for client {assignment['client_id']}")
+            if vpn["name"] in used_names:
+                logger.error(f"Duplicate VPN name: {vpn['name']}")
+                sys.exit(1)
+            used_names.add(vpn["name"])
+            
+            # Validate routing table ID
+            table_id = vpn["routing_table_id"]
+            if not isinstance(table_id, int):
+                logger.error(f"Invalid routing table ID for VPN {vpn['name']}: must be integer")
                 sys.exit(1)
                 
-            if assignment["vpn"] not in valid_vpn_names and assignment["vpn"] != "direct":
-                logger.error(f"Invalid VPN name in assignment for client {assignment['client_id']}: {assignment['vpn']}")
-                logger.error(f"Valid VPN names are: {', '.join(valid_vpn_names)} or 'direct'")
+            if table_id < min_table_id or table_id > max_table_id:
+                logger.error(f"Routing table ID {table_id} out of range ({min_table_id}-{max_table_id})")
                 sys.exit(1)
                 
-            # Check for duplicate client IDs
-            client_ids = [a["client_id"] for a in self.vpn_clients["assignments"]]
-            if client_ids.count(assignment["client_id"]) > 1:
-                logger.error(f"Duplicate client ID found: {assignment['client_id']}")
+            if table_id in used_table_ids:
+                logger.error(f"Duplicate routing table ID: {table_id}")
+                sys.exit(1)
+            used_table_ids.add(table_id)
+            
+            # Validate VPN assigned IP
+            try:
+                ipaddress.ip_network(vpn["vpn_assigned_ip"], strict=False)
+            except ValueError:
+                logger.error(f"Invalid VPN assigned IP: {vpn['vpn_assigned_ip']}")
                 sys.exit(1)
                 
+            # Validate veth network
+            try:
+                veth_network = ipaddress.ip_network(vpn["veth_network"], strict=False)
+                if veth_network.prefixlen > 30:
+                    logger.error(f"veth network prefix too small: {vpn['veth_network']}")
+                    sys.exit(1)
+                    
+                for existing_network in used_networks:
+                    if veth_network.overlaps(existing_network):
+                        logger.error(f"Overlapping veth networks: {vpn['veth_network']} and {existing_network}")
+                        sys.exit(1)
+                used_networks.add(veth_network)
+            except ValueError:
+                logger.error(f"Invalid veth network: {vpn['veth_network']}")
+                sys.exit(1)
+                
+            # Validate peer endpoint
+            if not re.match(r'^[a-zA-Z0-9.-]+:\d+$', vpn["peer_endpoint"]):
+                logger.error(f"Invalid peer endpoint: {vpn['peer_endpoint']} (must be host:port)")
+                sys.exit(1)
+
+        # Validate client assignments
+        if "assignments" not in self.vpn_clients:
+            logger.warning("No client assignments found")
+        else:
+            for client in self.vpn_clients["assignments"]:
+                # Check required fields
+                if "assigned_vpn" not in client:
+                    logger.error(f"Missing 'assigned_vpn' in client assignment")
+                    sys.exit(1)
+                    
+                if client["assigned_vpn"] not in used_names:
+                    logger.error(f"Client assigned to unknown VPN: {client['assigned_vpn']}")
+                    sys.exit(1)
+                    
+                # Check that client has either hostname or IP
+                if not client.get("hostname") and not client.get("ip_address"):
+                    logger.error(f"Client must have either hostname or IP address")
+                    sys.exit(1)
+                    
+                # If IP is specified, validate it
+                if client.get("ip_address"):
+                    try:
+                        ipaddress.ip_address(client["ip_address"])
+                    except ValueError:
+                        logger.error(f"Invalid client IP address: {client['ip_address']}")
+                        sys.exit(1)
+                        
+                # Check expiry date format if present
+                if client.get("assignment_expiry"):
+                    try:
+                        datetime.fromisoformat(client["assignment_expiry"].replace("Z", "+00:00"))
+                    except ValueError:
+                        logger.error(f"Invalid expiry format: {client['assignment_expiry']} (must be ISO format)")
+                        sys.exit(1)
+        
         logger.info("Configuration validation successful")
     
     def _get_active_vpns(self):
