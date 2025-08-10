@@ -45,7 +45,7 @@ fi
 check_requirements() {
     log "Checking system requirements..."
     
-    REQUIRED_COMMANDS=("ip" "wg" "getent" "systemctl" "networkctl" "python3" "iptables")
+    REQUIRED_COMMANDS=("ip" "wg" "getent" "systemctl" "networkctl" "python3" "firewall-cmd" "nft")
     
     for cmd in "${REQUIRED_COMMANDS[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
