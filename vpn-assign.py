@@ -351,7 +351,7 @@ def apply_configuration():
     try:
         # Call vpn-apply script
         logger.info("Applying VPN router configuration...")
-        subprocess.run(["/usr/local/bin/vpn-apply", "--auto"], check=True)
+        subprocess.run(["/usr/local/bin/vpn-apply.py"], check=True)
         logger.info("VPN router configuration applied successfully")
         return True
     except subprocess.CalledProcessError as e:

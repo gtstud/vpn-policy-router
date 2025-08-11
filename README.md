@@ -16,15 +16,16 @@ This system provides a declarative, policy-based routing solution for managing m
 - Safe "dry run" mode for testing configuration changes
 - Comprehensive validation to prevent misconfigurations
 - Zero impact on clients not explicitly assigned to a VPN
+- Automatic management of routing tables via `/etc/iproute2/rt_tables.d/`
 
 ## Prerequisites
 
 - Debian-based Linux system
 - systemd-networkd enabled and running
-- nftables package installed (for NAT functionality)
+- nftables package installed
 - WireGuard tools installed
 - Python 3.6+
-- iproute2 package
+- iproute2 package (version 5.2.0+ for rt_tables.d support)
 
 ## Installation
 
