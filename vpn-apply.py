@@ -353,13 +353,31 @@ class VPNRouter:
 
             self._run_cmd(["ip", "-n", ns_name, "link", "set", wg_if, "up"])
 
+            # Resolve endpoint hostname if necessary
+            peer_endpoint = vpn['peer_endpoint']
+            try:
+                host, port = peer_endpoint.rsplit(':', 1)
+                # Check if host is already an IP address
+                ipaddress.ip_address(host)
+                resolved_endpoint = peer_endpoint
+            except ValueError:
+                # It's a hostname, resolve it
+                try:
+                    resolved_ip = socket.gethostbyname(host)
+                    logger.debug(f"Resolved endpoint '{host}' to '{resolved_ip}'")
+                    resolved_endpoint = f"{resolved_ip}:{port}"
+                except socket.gaierror:
+                    logger.error(f"Could not resolve WireGuard endpoint hostname '{host}' for VPN '{vpn_name}'. Skipping peer configuration.")
+                    resolved_endpoint = None
+
             # The 'wg' command is not netns-aware, so we must use 'ip netns exec'
-            self._run_cmd([
-                "ip", "netns", "exec", ns_name, "wg", "set", wg_if,
-                "peer", vpn['peer_public_key'],
-                "endpoint", vpn['peer_endpoint'],
-                "allowed-ips", "0.0.0.0/0"
-            ])
+            if resolved_endpoint:
+                self._run_cmd([
+                    "ip", "netns", "exec", ns_name, "wg", "set", wg_if,
+                    "peer", vpn['peer_public_key'],
+                    "endpoint", resolved_endpoint,
+                    "allowed-ips", "0.0.0.0/0"
+                ])
 
             if not self._is_ip_on_interface(ns_name, wg_if, vpn['vpn_assigned_ip']):
                 self._run_cmd(["ip", "-n", ns_name, "addr", "add", vpn['vpn_assigned_ip'], "dev", wg_if])

@@ -202,7 +202,7 @@ def list_vpns_and_clients() -> None:
         print(f"Error listing VPNs and clients: {e}")
         sys.exit(1)
 
-def create_assignment(ip_address, hostname, vpn_name, expiry=None, display_name=None):
+def create_assignment(ip_address, hostname, vpn_name, expiry=None, display_name=None, verbose=False):
     """Create or update a VPN assignment for a client."""
     if not display_name and not ip_address and not hostname:
         logger.error("Cannot create assignment: at least one identifier (--display-name, --ip, or --hostname) is required.")
@@ -266,14 +266,14 @@ def create_assignment(ip_address, hostname, vpn_name, expiry=None, display_name=
 
     if save_json(VPN_CLIENTS_PATH, clients):
         logger.info("Assignment saved successfully.")
-        apply_configuration()
+        apply_configuration(verbose=verbose)
         return True
     else:
         logger.error("Failed to save assignment.")
         return False
 
 
-def remove_assignment(identifier):
+def remove_assignment(identifier, verbose=False):
     """Remove a client's VPN assignment by display name, IP, or hostname."""
     if not identifier:
         logger.error("Client identifier (display name, IP, or hostname) is required for removal.")
@@ -304,14 +304,14 @@ def remove_assignment(identifier):
 
     if save_json(VPN_CLIENTS_PATH, clients):
         logger.info("Client list saved successfully.")
-        apply_configuration()
+        apply_configuration(verbose=verbose)
         return True
     else:
         logger.error("Failed to save updated client list.")
         return False
 
 
-def remove_all_assignments():
+def remove_all_assignments(verbose=False):
     """Remove all client VPN assignments"""
     # Load config
     clients = load_json(VPN_CLIENTS_PATH)
@@ -331,7 +331,7 @@ def remove_all_assignments():
         logger.info(f"Removed all {count} client assignments")
         
         # Apply configuration to ensure VPN state matches assignments
-        apply_configuration()
+        apply_configuration(verbose=verbose)
         
         return True
     else:
@@ -339,12 +339,15 @@ def remove_all_assignments():
         return False
 
 
-def apply_configuration():
+def apply_configuration(verbose=False):
     """Apply the VPN router configuration"""
     try:
         # Call vpn-apply script
         logger.info("Applying VPN router configuration...")
-        subprocess.run(["/usr/local/bin/vpn-apply.py"], check=True)
+        cmd = ["/usr/local/bin/vpn-apply.py"]
+        if verbose:
+            cmd.append("--verbose")
+        subprocess.run(cmd, check=True)
         logger.info("VPN router configuration applied successfully")
         return True
     except subprocess.CalledProcessError as e:
@@ -377,8 +380,12 @@ def main():
     manage_group.add_argument("--list", action="store_true", help="List all client assignments")
     manage_group.add_argument("--remove", metavar="IDENTIFIER", help="Remove the assignment for the specified client (display name, IP, or hostname)")
     manage_group.add_argument("--remove-all", action="store_true", help="Remove all client assignments")
+    manage_group.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
     
     args = parser.parse_args()
+
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
     
     # Handle management actions
     if args.list:
@@ -386,11 +393,11 @@ def main():
         return
         
     if args.remove:
-        remove_assignment(args.remove)
+        remove_assignment(args.remove, verbose=args.verbose)
         return
         
     if args.remove_all:
-        remove_all_assignments()
+        remove_all_assignments(verbose=args.verbose)
         return
         
     # For assignments, need a client identifier and a VPN name
@@ -410,7 +417,7 @@ def main():
     # Handle removal via --vpn flag
     if args.vpn.lower() in ["none", "null", "direct"]:
         logger.info(f"VPN set to '{args.vpn}', attempting to remove assignment for client '{identifier}'.")
-        remove_assignment(identifier)
+        remove_assignment(identifier, verbose=args.verbose)
         return
 
     # Calculate expiry time
@@ -436,7 +443,7 @@ def main():
             return
             
     # Create the assignment
-    create_assignment(args.ip, args.hostname, args.vpn, expiry, args.display_name)
+    create_assignment(args.ip, args.hostname, args.vpn, expiry, args.display_name, verbose=args.verbose)
 
 
 if __name__ == "__main__":
