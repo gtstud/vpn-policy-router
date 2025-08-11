@@ -25,8 +25,7 @@ This specification explicitly **excludes** port forwarding capabilities.
 | **State Enforcement Script**| `/usr/local/bin/vpn-apply.py` | Python script that enforces the state defined in the JSON files. |
 | **Assignment Script** | `/usr/local/bin/vpn-assign.py` | Python CLI tool for users to manage client assignments. |
 | **Networking Service** | `systemd-networkd` | Declarative management of all network interfaces and routing. |
-| **Firewall Service** | `firewalld` | Manages the assignment of `veth` interfaces to security zones. |
-| **NAT Service** | `nftables` | Provides NAT (masquerade) functionality for VPN clients. |
+| **Firewall Service** | `nftables` | Manages firewall rules, including NAT for VPN clients. `firewalld` is used for zone management on the host. |
 | **Automation Mechanism** | `systemd` Timer | Periodically runs `vpn-apply.py` to enforce state and prune expired assignments. |
 
 ## 3.0 Configuration Data Model
