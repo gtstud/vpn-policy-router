@@ -190,6 +190,7 @@ class VPNRouter:
 
     def _get_vpn_resource_files(self, vpn_name):
         host_veth = f"v-{vpn_name}-v"
+        ns_veth = f"v-{vpn_name}-p"
         wg_if = f"v-{vpn_name}-w"
 
         files = [
@@ -555,6 +556,36 @@ class VPNRouter:
                 continue
 
             self._cleanup_vpn_resources(vpn_name)
+
+    def _sync_routing_tables(self, active_vpns):
+        logger.info("Synchronizing routing tables...")
+        RT_TABLES_DIR.mkdir(parents=True, exist_ok=True)
+
+        desired_files = set()
+        for vpn_name in active_vpns:
+            vpn_config = next((v for v in self.vpn_definitions['vpn_connections'] if v['name'] == vpn_name), None)
+            if not vpn_config or 'routing_table_id' not in vpn_config or 'routing_table_name' not in vpn_config:
+                logger.warning(f"VPN '{vpn_name}' is missing routing table info. Skipping table creation.")
+                continue
+
+            table_id = vpn_config['routing_table_id']
+            table_name = vpn_config['routing_table_name']
+            filename = f"99-vpn-router-{vpn_name}.conf"
+            desired_files.add(filename)
+            content = f"{table_id} {table_name}\n"
+            # Use _write_file to create the file idempotently.
+            self._write_file(RT_TABLES_DIR / filename, content, mode=0o644, owner='root', group='root')
+
+        # Cleanup orphaned files
+        current_files = {f.name for f in RT_TABLES_DIR.glob("99-vpn-router-*.conf")}
+        orphaned_files = current_files - desired_files
+
+        for filename in orphaned_files:
+            logger.info(f"Removing orphaned routing table file: {filename}")
+            if not self.dry_run:
+                (RT_TABLES_DIR / filename).unlink()
+            # Use a generic key since this might trigger a reload
+            self.changed_files.add("routing_tables_config")
 
     def run(self):
         logger.info("Starting VPN Policy Router apply run...")
