@@ -280,34 +280,32 @@ def remove_assignment(identifier, verbose=False):
         return False
 
     clients = load_json(VPN_CLIENTS_PATH)
-    if "assignments" not in clients:
+    if not clients.get("assignments"):
         logger.error("No assignments found to remove from.")
         return False
 
     original_count = len(clients["assignments"])
 
-    # Find the assignment by display name, IP, or hostname
-    assignment_to_remove = None
-    for assignment in clients["assignments"]:
-        if (assignment.get("display_name") == identifier or
-            assignment.get("ip_address") == identifier or
-            assignment.get("hostname") == identifier):
-            assignment_to_remove = assignment
-            break
+    # Find and remove the assignment that matches any of the identifiers
+    new_assignments = [
+        a for a in clients["assignments"]
+        if not (a.get("display_name") == identifier or
+                a.get("ip_address") == identifier or
+                a.get("hostname") == identifier)
+    ]
 
-    if assignment_to_remove:
-        clients["assignments"].remove(assignment_to_remove)
+    if len(new_assignments) < original_count:
+        clients["assignments"] = new_assignments
         logger.info(f"Removed assignment for client: {identifier}")
+        if save_json(VPN_CLIENTS_PATH, clients):
+            logger.info("Client list saved successfully.")
+            apply_configuration(verbose=verbose)
+            return True
+        else:
+            logger.error("Failed to save updated client list.")
+            return False
     else:
         logger.error(f"No assignment found for client identifier: {identifier}")
-        return False
-
-    if save_json(VPN_CLIENTS_PATH, clients):
-        logger.info("Client list saved successfully.")
-        apply_configuration(verbose=verbose)
-        return True
-    else:
-        logger.error("Failed to save updated client list.")
         return False
 
 
