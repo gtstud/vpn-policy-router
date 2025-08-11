@@ -200,6 +200,7 @@ class VPNRouter:
             NETWORKD_DIR / f"20-{wg_if}.netdev",
             NETWORKD_DIR / f"30-{wg_if}.network",
             NETWORKD_DIR / f"30-{ns_veth}.network",
+            RT_TABLES_DIR / f"99-vpn-router-{vpn_name}.conf",
         ]
 
         # Find associated client drop-in files
@@ -492,8 +493,8 @@ class VPNRouter:
             filename = f"99-vpn-router-{vpn_name}.conf"
             desired_files.add(filename)
             content = f"{table_id} {table_name}\n"
-            # Use _write_file to create the file idempotently. No header needed.
-            self._write_file(RT_TABLES_DIR / filename, content, mode=0o644, owner='root', group='root', add_header=False)
+            # Use _write_file to create the file idempotently.
+            self._write_file(RT_TABLES_DIR / filename, content, mode=0o644, owner='root', group='root')
 
         # Cleanup orphaned files
         current_files = {f.name for f in RT_TABLES_DIR.glob("99-vpn-router-*.conf")}
@@ -516,11 +517,22 @@ class VPNRouter:
 
         # Discover all VPNs that have any system files
         system_vpn_names = set()
-        for pattern in ["vpn-ns-*.service", "10-v-*-v.netdev", "10-v-*-v.network", "20-v-*-w.netdev", "30-v-*-w.network"]:
-            for f in (SYSTEMD_DIR if pattern.endswith('.service') else NETWORKD_DIR).glob(pattern):
-                match = re.search(r'ns-([a-zA-Z0-9_-]+)\.service', f.name) or re.search(r'v-([a-zA-Z0-9_-]+)-[vw]\.', f.name)
-                if match:
-                    system_vpn_names.add(match.groups()[-1])
+
+        search_patterns = {
+            SYSTEMD_DIR: ["vpn-ns-*.service"],
+            NETWORKD_DIR: ["10-v-*-v.netdev", "10-v-*-v.network", "20-v-*-w.netdev", "30-v-*-w.network", "30-v-*-p.network"],
+            RT_TABLES_DIR: ["99-vpn-router-*.conf"]
+        }
+
+        for directory, patterns in search_patterns.items():
+            for pattern in patterns:
+                for f in directory.glob(pattern):
+                    # Extract vpn_name from filename
+                    match = re.search(r'ns-([a-zA-Z0-9_-]+)\.service', f.name) or \
+                            re.search(r'v-([a-zA-Z0-9_-]+)-[vpw]\.', f.name) or \
+                            re.search(r'99-vpn-router-([a-zA-Z0-9_-]+)\.conf', f.name)
+                    if match:
+                        system_vpn_names.add(match.groups()[-1])
 
         orphaned_vpns = system_vpn_names - active_vpns
         self._check_and_cleanup_orphans(orphaned_vpns)
