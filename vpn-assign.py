@@ -203,118 +203,111 @@ def list_vpns_and_clients() -> None:
         sys.exit(1)
 
 def create_assignment(ip_address, hostname, vpn_name, expiry=None, display_name=None):
-    """Create a new VPN assignment for a client"""
-    if not ip_address and not hostname:
-        logger.error("Either IP address or hostname is required")
+    """Create or update a VPN assignment for a client."""
+    if not display_name and not ip_address and not hostname:
+        logger.error("Cannot create assignment: at least one identifier (--display-name, --ip, or --hostname) is required.")
         return False
-        
+
     if not vpn_name:
-        logger.error("VPN name is required")
+        logger.error("VPN name is required for assignment.")
         return False
-        
-    # Load configs
+
     clients = load_json(VPN_CLIENTS_PATH)
     vpn_defs = load_json(VPN_DEFINITIONS_PATH)
     
-    # Initialize clients structure if needed
-    if not clients:
-        clients = {"assignments": []}
-        
     if "assignments" not in clients:
         clients["assignments"] = []
-        
-    # Check if VPN exists
+
     valid_vpns = [vpn["name"] for vpn in vpn_defs.get("vpn_connections", [])]
-    if vpn_name != "direct" and vpn_name not in valid_vpns:
-        logger.error(f"Invalid VPN name: {vpn_name}. Valid options: {', '.join(valid_vpns)} or 'direct'")
+    if vpn_name not in valid_vpns:
+        logger.error(f"Invalid VPN name: '{vpn_name}'. Valid options: {', '.join(valid_vpns)}")
         return False
-        
-    # Check if client already exists - match by either IP or hostname
-    existing_idx = None
-    client_identifier = ip_address or hostname
+
+    # Find existing client primarily by display_name if provided, otherwise by IP/hostname
+    existing_client = None
+    if display_name:
+        for client in clients["assignments"]:
+            if client.get("display_name") == display_name:
+                existing_client = client
+                break
     
-    for i, assignment in enumerate(clients["assignments"]):
-        if (ip_address and assignment.get("ip_address") == ip_address) or \
-           (hostname and assignment.get("hostname") == hostname):
-            existing_idx = i
-            break
-            
-    # Create assignment object
-    assignment = {
-        "display_name": display_name or client_identifier,
-        "hostname": hostname,
-        "ip_address": ip_address,
-        "assigned_vpn": vpn_name,
-    }
-    
-    if expiry is not None:
-        # Format in ISO 8601 with UTC timezone
-        if isinstance(expiry, float) or isinstance(expiry, int):
-            dt = datetime.fromtimestamp(expiry, tz=timezone.utc)
-            assignment["assignment_expiry"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        else:
-            assignment["assignment_expiry"] = expiry
+    if not existing_client and (ip_address or hostname):
+         for client in clients["assignments"]:
+            if (ip_address and client.get("ip_address") == ip_address) or \
+               (hostname and client.get("hostname") == hostname):
+                existing_client = client
+                break
+
+    if existing_client:
+        logger.info(f"Updating existing client '{existing_client['display_name']}'")
+        # Update existing client
+        existing_client["assigned_vpn"] = vpn_name
+        existing_client["assignment_expiry"] = expiry
+        # Update identifiers if they were empty before
+        if not existing_client.get("ip_address") and ip_address:
+             existing_client["ip_address"] = ip_address
+        if not existing_client.get("hostname") and hostname:
+             existing_client["hostname"] = hostname
     else:
-        assignment["assignment_expiry"] = None
+        # Create new client
+        if not ip_address and not hostname:
+            logger.error("A new client assignment requires an IP address or a hostname.")
+            return False
         
-    # Update or append
-    if existing_idx is not None:
-        clients["assignments"][existing_idx] = assignment
-        logger.info(f"Updated assignment for {client_identifier} to VPN {vpn_name}")
-    else:
-        clients["assignments"].append(assignment)
-        logger.info(f"Created new assignment for {client_identifier} to VPN {vpn_name}")
-        
-    # Save updated config
+        new_client = {
+            "display_name": display_name or ip_address or hostname,
+            "hostname": hostname,
+            "ip_address": ip_address,
+            "assigned_vpn": vpn_name,
+            "assignment_expiry": expiry,
+        }
+        clients["assignments"].append(new_client)
+        logger.info(f"Creating new assignment for '{new_client['display_name']}'")
+
     if save_json(VPN_CLIENTS_PATH, clients):
-        logger.info("Assignment saved successfully")
-        
-        # Apply the configuration if not a direct assignment
-        if vpn_name != "direct":
-            apply_configuration()
-            
+        logger.info("Assignment saved successfully.")
+        apply_configuration()
         return True
     else:
-        logger.error("Failed to save assignment")
+        logger.error("Failed to save assignment.")
         return False
 
 
 def remove_assignment(identifier):
-    """Remove a client's VPN assignment by IP or hostname"""
+    """Remove a client's VPN assignment by display name, IP, or hostname."""
     if not identifier:
-        logger.error("Client identifier (IP or hostname) is required")
+        logger.error("Client identifier (display name, IP, or hostname) is required for removal.")
         return False
-        
-    # Load config
+
     clients = load_json(VPN_CLIENTS_PATH)
-    
     if "assignments" not in clients:
-        logger.error(f"No assignments found")
+        logger.error("No assignments found to remove from.")
         return False
-        
-    # Find and remove the assignment
-    found = False
-    for i, assignment in enumerate(clients["assignments"]):
-        if assignment.get("ip_address") == identifier or assignment.get("hostname") == identifier:
-            logger.info(f"Found assignment for {identifier}: VPN={assignment.get('assigned_vpn')}")
-            del clients["assignments"][i]
-            found = True
+
+    original_count = len(clients["assignments"])
+
+    # Find the assignment by display name, IP, or hostname
+    assignment_to_remove = None
+    for assignment in clients["assignments"]:
+        if (assignment.get("display_name") == identifier or
+            assignment.get("ip_address") == identifier or
+            assignment.get("hostname") == identifier):
+            assignment_to_remove = assignment
             break
-            
-    if not found:
-        logger.error(f"No assignment found for client {identifier}")
+
+    if assignment_to_remove:
+        clients["assignments"].remove(assignment_to_remove)
+        logger.info(f"Removed assignment for client: {identifier}")
+    else:
+        logger.error(f"No assignment found for client identifier: {identifier}")
         return False
-        
-    # Save updated config
+
     if save_json(VPN_CLIENTS_PATH, clients):
-        logger.info(f"Removed assignment for client {identifier}")
-        
-        # Apply configuration to ensure VPN state matches assignments
+        logger.info("Client list saved successfully.")
         apply_configuration()
-        
         return True
     else:
-        logger.error("Failed to save assignment changes")
+        logger.error("Failed to save updated client list.")
         return False
 
 
@@ -370,11 +363,11 @@ def main():
     client_group = parser.add_argument_group('Client Identification')
     client_group.add_argument("--ip", help="Specify client by IP address")
     client_group.add_argument("--hostname", help="Specify client by hostname")
-    client_group.add_argument("--display-name", help="Set a friendly display name for the client")
+    client_group.add_argument("--display-name", help="A friendly display name for the client. Used as the primary identifier for existing clients.")
     
     # Assignment options
     assign_group = parser.add_argument_group('Assignment Options')
-    assign_group.add_argument("--vpn", help="VPN name to assign the client to")
+    assign_group.add_argument("--vpn", help="VPN name to assign the client to. Use 'none', 'null', or 'direct' to remove an assignment.")
     assign_group.add_argument("--duration", help="Duration of assignment in seconds or with units (e.g., 30s, 5m, 2h, 1d)")
     assign_group.add_argument("--expire-at", help="Specific timestamp when the assignment expires (YYYY-MM-DD HH:MM:SS)")
     assign_group.add_argument("--permanent", action="store_true", help="Make the assignment permanent (never expires)")
@@ -382,7 +375,7 @@ def main():
     # Management options
     manage_group = parser.add_argument_group('Management Options')
     manage_group.add_argument("--list", action="store_true", help="List all client assignments")
-    manage_group.add_argument("--remove", metavar="IDENTIFIER", help="Remove the assignment for the specified client (IP or hostname)")
+    manage_group.add_argument("--remove", metavar="IDENTIFIER", help="Remove the assignment for the specified client (display name, IP, or hostname)")
     manage_group.add_argument("--remove-all", action="store_true", help="Remove all client assignments")
     
     args = parser.parse_args()
@@ -400,26 +393,28 @@ def main():
         remove_all_assignments()
         return
         
-    # For assignments, need client ID and VPN
-    ip_address = args.ip
-    hostname = args.hostname
-    
-    if not ip_address and not hostname:
+    # For assignments, need a client identifier and a VPN name
+    identifier = args.display_name or args.ip or args.hostname
+    if not identifier:
         if args.vpn:
-            logger.error("Client identification required. Specify --ip or --hostname.")
+            logger.error("Client identification required. Specify --display-name, --ip, or --hostname.")
             return
         else:
-            # If no specific action, show help
             parser.print_help()
             return
             
     if not args.vpn:
         logger.error("VPN name required. Specify --vpn.")
         return
-        
+
+    # Handle removal via --vpn flag
+    if args.vpn.lower() in ["none", "null", "direct"]:
+        logger.info(f"VPN set to '{args.vpn}', attempting to remove assignment for client '{identifier}'.")
+        remove_assignment(identifier)
+        return
+
     # Calculate expiry time
     expiry = None
-    
     if args.permanent:
         expiry = None
     elif args.expire_at:
@@ -441,7 +436,7 @@ def main():
             return
             
     # Create the assignment
-    create_assignment(ip_address, hostname, args.vpn, expiry, args.display_name)
+    create_assignment(args.ip, args.hostname, args.vpn, expiry, args.display_name)
 
 
 if __name__ == "__main__":
