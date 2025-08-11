@@ -326,16 +326,16 @@ class VPNRouter:
 
             # Configure interfaces inside the namespace imperatively
             logger.info(f"Configuring interfaces in namespace {ns_name}...")
-            self._run_cmd(["ip", "netns", "exec", ns_name, "ip", "link", "set", "lo", "up"])
+            self._run_cmd(["ip", "-n", ns_name, "link", "set", "lo", "up"])
 
-            self._run_cmd(["ip", "netns", "exec", ns_name, "ip", "link", "set", ns_veth, "up"])
+            self._run_cmd(["ip", "-n", ns_name, "link", "set", ns_veth, "up"])
             veth_ip_full = f"{ns_ip}/30"
             if not self._is_ip_on_interface(ns_name, ns_veth, veth_ip_full):
-                self._run_cmd(["ip", "netns", "exec", ns_name, "ip", "addr", "add", veth_ip_full, "dev", ns_veth])
+                self._run_cmd(["ip", "-n", ns_name, "addr", "add", veth_ip_full, "dev", ns_veth])
 
-            self._run_cmd(["ip", "netns", "exec", ns_name, "ip", "link", "set", wg_if, "up"])
+            self._run_cmd(["ip", "-n", ns_name, "link", "set", wg_if, "up"])
 
-            # The 'wg set' command is idempotent
+            # The 'wg' command is not netns-aware, so we must use 'ip netns exec'
             self._run_cmd([
                 "ip", "netns", "exec", ns_name, "wg", "set", wg_if,
                 "peer", vpn['peer_public_key'],
@@ -344,12 +344,13 @@ class VPNRouter:
             ])
 
             if not self._is_ip_on_interface(ns_name, wg_if, vpn['vpn_assigned_ip']):
-                self._run_cmd(["ip", "netns", "exec", ns_name, "ip", "addr", "add", vpn['vpn_assigned_ip'], "dev", wg_if])
+                self._run_cmd(["ip", "-n", ns_name, "addr", "add", vpn['vpn_assigned_ip'], "dev", wg_if])
 
-            self._run_cmd(["ip", "netns", "exec", ns_name, "ip", "route", "replace", "default", "dev", wg_if])
+            self._run_cmd(["ip", "-n", ns_name, "route", "replace", "default", "dev", wg_if])
 
             # Setup NAT inside the namespace
             logger.info(f"Setting up NAT inside namespace {ns_name}")
+            # The 'nft' command is not netns-aware, so we must use 'ip netns exec'
             self._run_cmd(['ip', 'netns', 'exec', ns_name, 'nft', 'add', 'table', 'ip', 'nat'], check=False)
             self._run_cmd(['ip', 'netns', 'exec', ns_name, 'nft', 'add', 'chain', 'ip', 'nat', 'POSTROUTING', '{ type nat hook postrouting priority 100 ; }'], check=False)
             self._run_cmd(['ip', 'netns', 'exec', ns_name, 'nft', 'add', 'rule', 'ip', 'nat', 'POSTROUTING', 'oifname', wg_if, 'masquerade'], check=False)
@@ -514,7 +515,7 @@ class VPNRouter:
             logger.warning(f"Invalid IP address format for check: {ip_with_prefix}")
             return False
 
-        cmd = ["ip", "netns", "exec", ns_name, "ip", "-j", "addr", "show", "dev", dev]
+        cmd = ["ip", "-n", ns_name, "-j", "addr", "show", "dev", dev]
         result = self._run_cmd(cmd, check=False)
         if not result or result.returncode != 0:
             return False
