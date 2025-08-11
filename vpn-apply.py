@@ -198,8 +198,6 @@ class VPNRouter:
             NETWORKD_DIR / f"10-{host_veth}.netdev",
             NETWORKD_DIR / f"10-{host_veth}.network",
             NETWORKD_DIR / f"20-{wg_if}.netdev",
-            NETWORKD_DIR / f"30-{wg_if}.network",
-            NETWORKD_DIR / f"30-{ns_veth}.network",
             RT_TABLES_DIR / f"99-vpn-router-{vpn_name}.conf",
         ]
 
@@ -317,7 +315,6 @@ class VPNRouter:
         self._write_file(NETWORKD_DIR / f"10-{host_veth}.network", f"[Match]\nName={host_veth}\n[Network]\nAddress={host_ip}/30", mode=network_files_mode, owner=network_files_owner, group=network_files_group)
         self._write_file(NETWORKD_DIR / f"30-{ns_veth}.network", f"[Match]\nName={ns_veth}\n[Network]\nAddress={ns_ip}/30", mode=network_files_mode, owner=network_files_owner, group=network_files_group)
         self._write_file(NETWORKD_DIR / f"20-{wg_if}.netdev", f"[NetDev]\nName={wg_if}\nKind=wireguard\n[WireGuard]\nPrivateKey={vpn['client_private_key']}", mode=network_files_mode, owner=network_files_owner, group=network_files_group)
-        self._write_file(NETWORKD_DIR / f"30-{wg_if}.network", f"[Match]\nName={wg_if}\n[Network]\nAddress={vpn['vpn_assigned_ip']}\nDefaultRouteOnDevice=true\n[WireGuardPeer]\nPublicKey={vpn['peer_public_key']}\nEndpoint={vpn['peer_endpoint']}\nAllowedIPs=0.0.0.0/0", mode=network_files_mode, owner=network_files_owner, group=network_files_group)
 
         self._run_cmd(["systemctl", "daemon-reload"])
         self._run_cmd(["systemctl", "enable", "--now", f"vpn-ns-{vpn_name}.service"])
@@ -327,10 +324,34 @@ class VPNRouter:
         if self._wait_for_interface(host_veth) and self._wait_for_interface(wg_if):
             self._run_cmd(["ip", "link", "set", wg_if, "netns", ns_name], check=False)
             self._run_cmd(["ip", "link", "set", ns_veth, "netns", ns_name], check=False)
-            self._run_cmd(["ip", "netns", "exec", ns_name, "systemctl", "restart", "systemd-networkd"], check=False)
+
+            # Configure interfaces inside the namespace imperatively
+            logger.info(f"Configuring interfaces in namespace {ns_name}...")
+            self._run_cmd(["ip", "-n", ns_name, "link", "set", "lo", "up"])
+
+            self._run_cmd(["ip", "-n", ns_name, "link", "set", ns_veth, "up"])
+            veth_ip_full = f"{ns_ip}/30"
+            if not self._is_ip_on_interface(ns_name, ns_veth, veth_ip_full):
+                self._run_cmd(["ip", "-n", ns_name, "addr", "add", veth_ip_full, "dev", ns_veth])
+
+            self._run_cmd(["ip", "-n", ns_name, "link", "set", wg_if, "up"])
+
+            # The 'wg' command is not netns-aware, so we must use 'ip netns exec'
+            self._run_cmd([
+                "ip", "netns", "exec", ns_name, "wg", "set", wg_if,
+                "peer", vpn['peer_public_key'],
+                "endpoint", vpn['peer_endpoint'],
+                "allowed-ips", "0.0.0.0/0"
+            ])
+
+            if not self._is_ip_on_interface(ns_name, wg_if, vpn['vpn_assigned_ip']):
+                self._run_cmd(["ip", "-n", ns_name, "addr", "add", vpn['vpn_assigned_ip'], "dev", wg_if])
+
+            self._run_cmd(["ip", "-n", ns_name, "route", "replace", "default", "dev", wg_if])
 
             # Setup NAT inside the namespace
             logger.info(f"Setting up NAT inside namespace {ns_name}")
+            # The 'nft' command is not netns-aware, so we must use 'ip netns exec'
             self._run_cmd(['ip', 'netns', 'exec', ns_name, 'nft', 'add', 'table', 'ip', 'nat'], check=False)
             self._run_cmd(['ip', 'netns', 'exec', ns_name, 'nft', 'add', 'chain', 'ip', 'nat', 'POSTROUTING', '{ type nat hook postrouting priority 100 ; }'], check=False)
             self._run_cmd(['ip', 'netns', 'exec', ns_name, 'nft', 'add', 'rule', 'ip', 'nat', 'POSTROUTING', 'oifname', wg_if, 'masquerade'], check=False)
@@ -459,6 +480,65 @@ class VPNRouter:
                 if not self.dry_run: f.unlink()
         self.changed_files.add("deleted_vpn_files")
 
+    def _sync_routing_tables(self, active_vpns):
+        logger.info("Synchronizing routing tables...")
+        RT_TABLES_DIR.mkdir(parents=True, exist_ok=True)
+
+        desired_files = set()
+        for vpn_name in active_vpns:
+            vpn_config = next((v for v in self.vpn_definitions['vpn_connections'] if v['name'] == vpn_name), None)
+            if not vpn_config or 'routing_table_id' not in vpn_config or 'routing_table_name' not in vpn_config:
+                logger.warning(f"VPN '{vpn_name}' is missing routing table info. Skipping table creation.")
+                continue
+
+            table_id = vpn_config['routing_table_id']
+            table_name = vpn_config['routing_table_name']
+            filename = f"99-vpn-router-{vpn_name}.conf"
+            desired_files.add(filename)
+            content = f"{table_id} {table_name}\n"
+            self._write_file(RT_TABLES_DIR / filename, content, mode=0o644, owner='root', group='root')
+
+        current_files = {f.name for f in RT_TABLES_DIR.glob("99-vpn-router-*.conf")}
+        orphaned_files = current_files - desired_files
+
+        for filename in orphaned_files:
+            logger.info(f"Removing orphaned routing table file: {filename}")
+            if not self.dry_run:
+                (RT_TABLES_DIR / filename).unlink()
+            self.changed_files.add("routing_tables_config")
+
+    def _is_ip_on_interface(self, ns_name, dev, ip_with_prefix):
+        """Check if a specific IP address with prefix is on an interface in a namespace."""
+        try:
+            ip_to_check = ipaddress.ip_interface(ip_with_prefix).ip
+            prefix_to_check = ipaddress.ip_interface(ip_with_prefix).network.prefixlen
+        except ValueError:
+            logger.warning(f"Invalid IP address format for check: {ip_with_prefix}")
+            return False
+
+        cmd = ["ip", "-n", ns_name, "-j", "addr", "show", "dev", dev]
+        result = self._run_cmd(cmd, check=False)
+        if not result or result.returncode != 0:
+            return False
+
+        try:
+            ip_info = json.loads(result.stdout)
+            if not ip_info:
+                return False
+
+            for addr_info in ip_info[0].get("addr_info", []):
+                if addr_info.get("family") == "inet":
+                    local_ip = ipaddress.ip_address(addr_info.get("local"))
+                    prefixlen = addr_info.get("prefixlen")
+                    if local_ip == ip_to_check and prefixlen == prefix_to_check:
+                        logger.debug(f"IP {ip_with_prefix} already exists on {dev} in {ns_name}.")
+                        return True
+        except (json.JSONDecodeError, IndexError, KeyError, TypeError) as e:
+            logger.warning(f"Could not parse IP address info for {dev} in {ns_name}: {e}")
+            return False
+
+        return False
+
     def _check_and_cleanup_orphans(self, orphaned_vpns):
         logger.info("Checking for orphaned VPN resources...")
         
@@ -520,7 +600,7 @@ class VPNRouter:
 
         search_patterns = {
             SYSTEMD_DIR: ["vpn-ns-*.service"],
-            NETWORKD_DIR: ["10-v-*-v.netdev", "10-v-*-v.network", "20-v-*-w.netdev", "30-v-*-w.network", "30-v-*-p.network"],
+            NETWORKD_DIR: ["10-v-*-v.netdev", "10-v-*-v.network", "20-v-*-w.netdev"],
             RT_TABLES_DIR: ["99-vpn-router-*.conf"]
         }
 
