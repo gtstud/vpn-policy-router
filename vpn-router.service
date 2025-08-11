@@ -5,7 +5,7 @@ Documentation=https://github.com/gtstudis/vpn-policy-router
 
 [Service]
 Type=oneshot
-ExecStart=/opt/vpn-router/vpn-apply.py
+ExecStart=/usr/local/bin/vpn-apply.py
 RemainAfterExit=true
 
 [Install]
