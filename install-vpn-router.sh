@@ -13,8 +13,6 @@ set -e
 CONFIG_DIR="/etc/vpn-router"
 SCRIPT_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
-CURRENT_USER="gtstud"
-CURRENT_TIMESTAMP="2025-08-09 21:01:09"
 
 # ANSI colors for terminal output
 GREEN='\033[0;32m'
