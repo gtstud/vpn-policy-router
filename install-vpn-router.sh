@@ -163,19 +163,21 @@ install_scripts() {
     log "Installing VPN router scripts..."
     
     # Verify that scripts exist in the current directory
-    if [ ! -f "vpn-apply.py" ] || [ ! -f "vpn-router-check.py" ]; then
+    if [ ! -f "vpn-apply.py" ] || [ ! -f "vpn-router-check.py" ] || [ ! -f "vpn-assign.py" ]; then
         error "Required script files not found in the current directory"
-        error "Make sure vpn-apply.py and vpn-router-check.py are in the same directory as this install script"
+        error "Make sure vpn-apply.py, vpn-router-check.py, and vpn-assign.py are in the same directory as this install script"
         exit 1
     fi
     
     # Copy scripts to the destination directory
     cp "vpn-apply.py" "${SCRIPT_DIR}/"
     cp "vpn-router-check.py" "${SCRIPT_DIR}/"
+    cp "vpn-assign.py" "${SCRIPT_DIR}/"
     
     # Make scripts executable
     chmod 755 "${SCRIPT_DIR}/vpn-apply.py"
     chmod 755 "${SCRIPT_DIR}/vpn-router-check.py"
+    chmod 755 "${SCRIPT_DIR}/vpn-assign.py"
     
     log "VPN router scripts installed successfully"
 }
