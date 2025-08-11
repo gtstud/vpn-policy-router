@@ -336,6 +336,7 @@ class VPNRouter:
             return
 
         self._run_cmd(["networkctl", "reload"])
+        self._run_cmd(["udevadm", "settle"])
 
         # Wait for interfaces to be created before moving them
         if self._wait_for_interface(host_veth) and self._wait_for_interface(wg_if):
@@ -505,9 +506,25 @@ class VPNRouter:
         if "firewalld_config" in self.changed_files:
             self._run_cmd(['firewall-cmd', '--reload'])
 
+    def _wait_for_service_inactive(self, service_name, timeout=5):
+        logger.debug(f"Waiting for service {service_name} to become inactive...")
+        for _ in range(timeout):
+            # is-active returns non-zero if the service is not active
+            result = self._run_cmd(['systemctl', 'is-active', service_name], check=False)
+            if result and result.returncode != 0:
+                logger.debug(f"Service {service_name} is inactive.")
+                return True
+            time.sleep(1)
+        logger.error(f"Timeout waiting for service {service_name} to become inactive.")
+        return False
+
     def _cleanup_vpn_resources(self, vpn_name):
         logger.info(f"Cleaning up resources for orphaned VPN '{vpn_name}'...")
-        self._run_cmd(["systemctl", "disable", "--now", f"vpn-ns-{vpn_name}.service"], check=False)
+        service_name = f"vpn-ns-{vpn_name}.service"
+        self._run_cmd(["systemctl", "disable", "--now", service_name], check=False)
+        if not self._wait_for_service_inactive(service_name):
+            logger.warning(f"Service {service_name} did not become inactive. File cleanup may be incomplete.")
+            return
 
         for f in self._get_vpn_resource_files(vpn_name):
             if f.exists():
