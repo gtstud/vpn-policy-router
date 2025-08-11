@@ -295,6 +295,17 @@ class VPNRouter:
         logger.error(f"Timeout waiting for interface {if_name} to appear.")
         return False
 
+    def _wait_for_namespace(self, ns_name, timeout=5):
+        logger.debug(f"Waiting for namespace {ns_name} to appear...")
+        for _ in range(timeout):
+            result = self._run_cmd(['ip', 'netns', 'list'], check=False)
+            if result and result.returncode == 0 and ns_name in result.stdout:
+                logger.debug(f"Namespace {ns_name} found.")
+                return True
+            time.sleep(1)
+        logger.error(f"Timeout waiting for namespace {ns_name} to appear.")
+        return False
+
     def _apply_vpn_config(self, vpn):
         vpn_name = vpn["name"]
         ns_name = f"ns-{vpn_name}"
@@ -318,6 +329,12 @@ class VPNRouter:
 
         self._run_cmd(["systemctl", "daemon-reload"])
         self._run_cmd(["systemctl", "enable", "--now", f"vpn-ns-{vpn_name}.service"])
+
+        # Wait for the namespace to be created before proceeding
+        if not self._wait_for_namespace(ns_name):
+            logger.error(f"Namespace {ns_name} failed to create. Aborting configuration for this VPN.")
+            return
+
         self._run_cmd(["networkctl", "reload"])
 
         # Wait for interfaces to be created before moving them
