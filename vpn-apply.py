@@ -237,16 +237,18 @@ class VPNRouter:
         return result and result.returncode == 0 and ns_name in result.stdout
 
     def _link_exists(self, link_name, ns_name=None):
-        cmd = ['ip', 'link', 'show', link_name]
         if ns_name:
-            cmd = ['ip', '-n', ns_name] + cmd
+            cmd = ['ip', '-n', ns_name, 'link', 'show', link_name]
+        else:
+            cmd = ['ip', 'link', 'show', link_name]
         result = self._run_cmd(cmd, check=False)
         return result and result.returncode == 0
 
     def _get_link_ip(self, link_name, ns_name=None):
-        cmd = ['ip', '-j', 'addr', 'show', link_name]
         if ns_name:
-            cmd = ['ip', '-n', ns_name] + cmd
+            cmd = ['ip', '-n', ns_name, '-j', 'addr', 'show', link_name]
+        else:
+            cmd = ['ip', '-j', 'addr', 'show', link_name]
         result = self._run_cmd(cmd, check=False)
         if not result or result.returncode != 0:
             return None
