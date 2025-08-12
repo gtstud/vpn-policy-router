@@ -113,7 +113,11 @@ class VPNRouter:
 
             # A simple regex for WireGuard keys (44-char Base64)
             key_regex = re.compile(r'^[A-Za-z0-9+/]{43}=$')
-            if not key_regex.match(vpn['client_private_key']) or not key_regex.match(vpn['peer_public_key']):
+            if 'client_public_key' not in vpn:
+                raise ValueError(f"Missing 'client_public_key' in VPN '{vpn['name']}'")
+            if not key_regex.match(vpn['client_private_key']) or \
+               not key_regex.match(vpn['peer_public_key']) or \
+               not key_regex.match(vpn['client_public_key']):
                 raise ValueError(f"Invalid WireGuard key format in VPN '{vpn['name']}'")
 
         # --- Validate vpn-clients.json ---

@@ -42,6 +42,7 @@ This file is the static source of truth for the VPN infrastructure.
 | `name` | String | A unique, human-readable name for the VPN (e.g., "vpnX"). |
 | `description` | String | Optional description of the VPN endpoint (e.g., "Provider X - London"). |
 | `client_private_key`| String | The client's WireGuard private key. |
+| `client_public_key` | String | The client's corresponding public key. Stored for record-keeping. |
 | `peer_public_key` | String | The public key of the remote WireGuard server peer. |
 | `peer_endpoint` | String | The `hostname:port` of the remote WireGuard server. |
 | `vpn_assigned_ip` | String (CIDR) | The IP address assigned to the client by the VPN provider (e.g., "10.64.0.2/32"). |
