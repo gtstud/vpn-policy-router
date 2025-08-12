@@ -237,16 +237,18 @@ class VPNRouter:
         return result and result.returncode == 0 and ns_name in result.stdout
 
     def _link_exists(self, link_name, ns_name=None):
-        cmd = ['ip', 'link', 'show', link_name]
         if ns_name:
-            cmd = ['ip', '-n', ns_name] + cmd
+            cmd = ['ip', '-n', ns_name, 'link', 'show', link_name]
+        else:
+            cmd = ['ip', 'link', 'show', link_name]
         result = self._run_cmd(cmd, check=False)
         return result and result.returncode == 0
 
     def _get_link_ip(self, link_name, ns_name=None):
-        cmd = ['ip', '-j', 'addr', 'show', link_name]
         if ns_name:
-            cmd = ['ip', '-n', ns_name] + cmd
+            cmd = ['ip', '-n', ns_name, '-j', 'addr', 'show', link_name]
+        else:
+            cmd = ['ip', '-j', 'addr', 'show', link_name]
         result = self._run_cmd(cmd, check=False)
         if not result or result.returncode != 0:
             return None
@@ -289,6 +291,25 @@ class VPNRouter:
         logger.warning(f"Could not find route/interface for local IP: {ip_address}")
         return None
 
+    def _get_subnet_for_interface(self, lan_if):
+        """Get the IPv4 subnet for a given interface."""
+        cmd = ['ip', '-j', 'addr', 'show', 'dev', lan_if]
+        result = self._run_cmd(cmd, check=False)
+        if not result or result.returncode != 0:
+            return None
+        try:
+            addr_info = json.loads(result.stdout)
+            if addr_info and addr_info[0].get('addr_info'):
+                for addr in addr_info[0]['addr_info']:
+                    if addr.get('family') == 'inet':
+                        # Use the ipaddress module to correctly calculate the network address
+                        ip_if = ipaddress.ip_interface(f"{addr['local']}/{addr['prefixlen']}")
+                        return str(ip_if.network)
+        except (json.JSONDecodeError, IndexError, KeyError):
+            pass
+        logger.warning(f"Could not determine subnet for interface {lan_if}")
+        return None
+
     def _get_table_default_route(self, table_name):
         """Check for a default route in a specific routing table."""
         cmd = ['ip', '-j', 'route', 'show', 'table', table_name]
@@ -304,7 +325,28 @@ class VPNRouter:
             return None
         return None
 
-    def _apply_vpn_config(self, vpn):
+    def _get_namespace_lan_routes(self, ns_name, via_ip):
+        """Get LAN-specific routes from a namespace that go via a specific gateway."""
+        routes = set()
+        cmd = ['ip', '-j', '-n', ns_name, 'route', 'show']
+        result = self._run_cmd(cmd, check=False)
+        if not result or result.returncode != 0:
+            return routes
+        try:
+            route_info = json.loads(result.stdout)
+            for route in route_info:
+                if route.get("gateway") == via_ip:
+                    # We only want to manage private IP space routes
+                    try:
+                        if ipaddress.ip_network(route.get("dst")).is_private:
+                            routes.add(route.get("dst"))
+                    except (ValueError, TypeError):
+                        continue
+        except (json.JSONDecodeError, IndexError):
+            pass
+        return routes
+
+    def _apply_vpn_config(self, vpn, lan_subnets):
         vpn_name = vpn["name"]
         ns_name = f"ns-{vpn_name}"
         host_veth, ns_veth = f"v-{vpn_name}-v", f"v-{vpn_name}-p"
@@ -388,6 +430,23 @@ class VPNRouter:
         # 8. Bring up WireGuard interface and set default route
         self._run_cmd(["ip", "-n", ns_name, "link", "set", wg_if, "up"])
         self._run_cmd(["ip", "-n", ns_name, "route", "replace", "default", "dev", wg_if])
+
+        # 8b. Synchronize routes back to the specific LAN subnets of the clients using this VPN
+        logger.info(f"Synchronizing LAN routes in {ns_name}")
+        current_lan_routes = self._get_namespace_lan_routes(ns_name, host_ip)
+        desired_lan_routes = lan_subnets # This is already a set
+
+        # Add missing routes
+        for subnet in (desired_lan_routes - current_lan_routes):
+            logger.info(f"Adding LAN route in {ns_name} for {subnet} via {host_ip}")
+            self._run_cmd(["ip", "-n", ns_name, "route", "add", subnet, "via", host_ip])
+            self.changed_files.add(f"lan_route_{ns_name}_{subnet}")
+
+        # Remove orphaned routes
+        for subnet in (current_lan_routes - desired_lan_routes):
+            logger.info(f"Removing stale LAN route in {ns_name} for {subnet}")
+            self._run_cmd(["ip", "-n", ns_name, "route", "del", subnet])
+            self.changed_files.add(f"lan_route_del_{ns_name}_{subnet}")
 
         # 9. Setup NAT inside the namespace
         logger.info(f"Setting up NAT inside namespace {ns_name}")
@@ -573,6 +632,16 @@ class VPNRouter:
         resolved_clients_map = self._resolve_assignments()
         active_vpns = set(resolved_clients_map.keys())
 
+        # Determine required LAN subnets for each VPN
+        vpn_lan_subnets = {}
+        for vpn_name, clients in resolved_clients_map.items():
+            subnets = set()
+            for client in clients:
+                subnet = self._get_subnet_for_interface(client['lan_if'])
+                if subnet:
+                    subnets.add(subnet)
+            vpn_lan_subnets[vpn_name] = subnets
+
         # Cleanup phase
         orphaned_vpns = self._check_and_cleanup_orphans(active_vpns)
 
@@ -582,7 +651,7 @@ class VPNRouter:
         for vpn_name in active_vpns:
             vpn_config = next((v for v in self.vpn_definitions['vpn_connections'] if v['name'] == vpn_name), None)
             if vpn_config:
-                self._apply_vpn_config(vpn_config)
+                self._apply_vpn_config(vpn_config, vpn_lan_subnets.get(vpn_name, set()))
 
         self._sync_routing_rules(resolved_clients_map)
         self._sync_firewalld_zones(active_vpns, orphaned_vpns)
