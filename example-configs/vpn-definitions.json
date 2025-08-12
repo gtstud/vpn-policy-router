@@ -4,7 +4,7 @@
       "zone_vpn": "vpn_out"
     },
     "veth_network_range": {
-      "prefix": "192.168"
+      "prefix": "10.239"
     },
     "routing_table_id_range": {
       "min": 7001,
@@ -20,7 +20,7 @@
       "peer_public_key": "PEER_PUBLIC_KEY_HERE",
       "peer_endpoint": "london.vpnprovider.com:51820",
       "vpn_assigned_ip": "10.64.0.2/32",
-      "veth_network": "192.168.1.0/30",
+      "veth_network": "10.239.1.0/30",
       "routing_table_id": 7001,
       "routing_table_name": "vpn1_tbl"
     },
@@ -32,7 +32,7 @@
       "peer_public_key": "PEER_PUBLIC_KEY_HERE",
       "peer_endpoint": "frankfurt.vpnprovider.com:51820",
       "vpn_assigned_ip": "10.65.0.3/32",
-      "veth_network": "192.168.2.0/30",
+      "veth_network": "10.239.2.0/30",
       "routing_table_id": 7002,
       "routing_table_name": "vpn2_tbl"
     }

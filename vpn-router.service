@@ -1,7 +1,6 @@
 [Unit]
 Description=Declarative Policy-Based VPN Router
 After=network.target
-Documentation=https://github.com/gtstudis/vpn-policy-router
 
 [Service]
 Type=oneshot
