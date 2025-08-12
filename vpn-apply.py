@@ -345,10 +345,12 @@ class VPNRouter:
             self.changed_files.add(f"ip_{ns_veth}")
         self._run_cmd(["ip", "-n", ns_name, "link", "set", ns_veth, "up"])
 
-        # 5. Create WireGuard interface if not exists
+        # 5. Create and move WireGuard interface if not exists
         if not self._link_exists(wg_if, ns_name):
-            logger.info(f"Creating WireGuard interface {wg_if} in {ns_name}")
-            self._run_cmd(["ip", "-n", ns_name, "link", "add", wg_if, "type", "wireguard"])
+            logger.info(f"Creating WireGuard interface {wg_if}")
+            self._run_cmd(["ip", "link", "add", wg_if, "type", "wireguard"])
+            logger.info(f"Moving {wg_if} to namespace {ns_name}")
+            self._run_cmd(["ip", "link", "set", wg_if, "netns", ns_name])
             self.changed_files.add(f"link_{wg_if}")
 
         # 6. Configure WireGuard interface
