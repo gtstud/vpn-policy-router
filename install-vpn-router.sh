@@ -43,7 +43,7 @@ fi
 check_requirements() {
     log "Checking system requirements..."
     
-    REQUIRED_COMMANDS=("ip" "wg" "getent" "systemctl" "networkctl" "python3" "firewall-cmd" "nft")
+    REQUIRED_COMMANDS=("ip" "wg" "getent" "systemctl" "python3" "firewall-cmd" "nft")
     
     for cmd in "${REQUIRED_COMMANDS[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -66,48 +66,6 @@ check_requirements() {
     log "All requirements satisfied"
 }
 
-# Check for conflicts with existing system configuration
-check_for_conflicts() {
-    log "Checking for conflicts with existing system configuration..."
-    
-    # Extract ranges from config if it exists
-    if [ -f "${CONFIG_DIR}/vpn-definitions.json" ]; then
-        # Use grep and sed to extract ranges (since jq might not be installed)
-        MIN_TABLE_ID=$(grep -o '"min": *[0-9]*' "${CONFIG_DIR}/vpn-definitions.json" | sed 's/.*: *//' || echo "7001")
-        MAX_TABLE_ID=$(grep -o '"max": *[0-9]*' "${CONFIG_DIR}/vpn-definitions.json" | sed 's/.*: *//' || echo "7200")
-        NETWORK_PREFIX=$(grep -o '"prefix": *"[^"]*"' "${CONFIG_DIR}/vpn-definitions.json" | sed 's/.*: *"//' | sed 's/"//' || echo "10.239")
-    else
-        # Default ranges for new installation
-        MIN_TABLE_ID=7001
-        MAX_TABLE_ID=7200
-        NETWORK_PREFIX="10.239"
-    fi
-    
-    # Check for routing tables in our range
-    if grep -qE "^${MIN_TABLE_ID}|^${MAX_TABLE_ID}" /etc/iproute2/rt_tables 2>/dev/null; then
-        if [ -f "${CONFIG_DIR}/vpn-definitions.json" ]; then
-            warning "Found routing tables in VPN router range (${MIN_TABLE_ID}-${MAX_TABLE_ID}). This is expected for an existing installation."
-        else
-            error "Found existing routing tables in the range ${MIN_TABLE_ID}-${MAX_TABLE_ID}. These conflict with VPN router."
-            error "Please choose a different routing table range or remove the conflicting tables."
-            return 1
-        fi
-    fi
-    
-    # Check for IP addresses in our range
-    if ip addr | grep -q "${NETWORK_PREFIX}\."; then
-        if [ -f "${CONFIG_DIR}/vpn-definitions.json" ]; then
-            warning "Found IP addresses in VPN router range (${NETWORK_PREFIX}). This is expected for an existing installation."
-        else
-            error "Found existing IP addresses in the range ${NETWORK_PREFIX}. These conflict with VPN router."
-            error "Please choose a different IP range or remove the conflicting addresses."
-            return 1
-        fi
-    fi
-    
-    return 0
-}
-
 # Create configuration directory and default config files
 create_config_dir() {
     log "Creating configuration directory..."
@@ -118,12 +76,8 @@ create_config_dir() {
     cat > "${CONFIG_DIR}/vpn-definitions.json.default" << EOF
 {
   "system_config": {
-    "routing_table_id_range": {
-      "min": 7001,
-      "max": 7200
-    },
-    "veth_network_range": {
-      "prefix": "10.239"
+    "firewalld": {
+      "zone_vpn": "trusted"
     }
   },
   "vpn_connections": []
@@ -218,7 +172,6 @@ run_installation() {
     log "Starting VPN Router installation..."
     
     check_requirements
-    check_for_conflicts || exit 1
     create_config_dir
     install_scripts
     install_systemd_units
