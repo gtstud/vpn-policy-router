@@ -57,9 +57,9 @@ class VPNRouter:
         if path == VPN_DEFINITIONS_PATH:
             template = {
                 "system_config": {
-                    "firewalld": {"zone_lan": "trusted", "zone_vpn": "trusted"},
-                    "lan_network_files": {},
-                    "nat": {"lan_subnets": ["192.168.0.0/16"]}
+                    "firewalld": {"zone_vpn": "trusted"},
+                    "veth_network_range": {"prefix": "10.239"},
+                    "routing_table_id_range": {"min": 7001, "max": 7200}
                 },
                 "vpn_connections": []
             }
@@ -79,6 +79,17 @@ class VPNRouter:
         if "firewalld" not in self.vpn_definitions["system_config"] or "zone_vpn" not in self.vpn_definitions["system_config"]["firewalld"]:
             raise ValueError("Missing 'firewalld.zone_vpn' in system_config")
 
+        veth_range_config = self.vpn_definitions["system_config"].get("veth_network_range", {})
+        veth_prefix = veth_range_config.get("prefix")
+        if not veth_prefix:
+            raise ValueError("Missing 'veth_network_range.prefix' in system_config")
+
+        routing_table_range_config = self.vpn_definitions["system_config"].get("routing_table_id_range", {})
+        min_table_id = routing_table_range_config.get("min")
+        max_table_id = routing_table_range_config.get("max")
+        if min_table_id is None or max_table_id is None:
+            raise ValueError("Missing 'routing_table_id_range.min' or 'max' in system_config")
+
         vpn_conns = self.vpn_definitions.get("vpn_connections", [])
         seen_names = set()
         seen_table_ids = set()
@@ -86,11 +97,16 @@ class VPNRouter:
             if vpn['name'] in seen_names: raise ValueError(f"Duplicate VPN name found: {vpn['name']}")
             seen_names.add(vpn['name'])
 
-            if vpn['routing_table_id'] in seen_table_ids: raise ValueError(f"Duplicate routing_table_id: {vpn['routing_table_id']}")
-            seen_table_ids.add(vpn['routing_table_id'])
+            table_id = vpn['routing_table_id']
+            if not (min_table_id <= table_id <= max_table_id):
+                raise ValueError(f"routing_table_id {table_id} for VPN '{vpn['name']}' is outside the allowed range {min_table_id}-{max_table_id}")
+            if table_id in seen_table_ids: raise ValueError(f"Duplicate routing_table_id: {table_id}")
+            seen_table_ids.add(table_id)
 
             try:
-                ipaddress.ip_network(vpn['veth_network'])
+                veth_net = ipaddress.ip_network(vpn['veth_network'])
+                if not str(veth_net.network_address).startswith(veth_prefix):
+                    raise ValueError(f"veth_network '{vpn['veth_network']}' is not in the required range '{veth_prefix}.*'")
                 ipaddress.ip_interface(vpn['vpn_assigned_ip']) # Use ip_interface for host IPs
             except ValueError as e:
                 raise ValueError(f"Invalid CIDR notation in VPN '{vpn['name']}': {e}")

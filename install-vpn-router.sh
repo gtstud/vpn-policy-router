@@ -78,6 +78,13 @@ create_config_dir() {
   "system_config": {
     "firewalld": {
       "zone_vpn": "trusted"
+    },
+    "veth_network_range": {
+      "prefix": "10.239"
+    },
+    "routing_table_id_range": {
+      "min": 7001,
+      "max": 7200
     }
   },
   "vpn_connections": []

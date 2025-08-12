@@ -1,21 +1,14 @@
 {
   "system_config": {
+    "firewalld": {
+      "zone_vpn": "vpn_out"
+    },
+    "veth_network_range": {
+      "prefix": "192.168"
+    },
     "routing_table_id_range": {
       "min": 7001,
       "max": 7200
-    },
-    "veth_network_range": {
-      "prefix": "10.239"
-    },
-    "firewalld": {
-      "zone_lan": "internal",
-      "zone_vpn": "vpn_out"
-    },
-    "nat": {
-      "lan_subnets": ["10.168.99.0/24"]
-    },
-    "lan_network_files": {
-      "br0": "10-lan.network"
     }
   },
   "vpn_connections": [
@@ -23,27 +16,23 @@
       "name": "vpn1",
       "description": "Provider X - London",
       "client_private_key": "YOUR_PRIVATE_KEY_HERE",
-      "client_public_key": "YOUR_PUBLIC_KEY_HERE",
       "peer_public_key": "PEER_PUBLIC_KEY_HERE",
       "peer_endpoint": "london.vpnprovider.com:51820",
       "vpn_assigned_ip": "10.64.0.2/32",
       "veth_network": "192.168.1.0/30",
       "routing_table_id": 7001,
-      "routing_table_name": "vpn1_tbl",
-      "router_lan_interface": "br0"
+      "routing_table_name": "vpn1_tbl"
     },
     {
       "name": "vpn2",
       "description": "Provider Y - Frankfurt",
       "client_private_key": "YOUR_PRIVATE_KEY_HERE",
-      "client_public_key": "YOUR_PUBLIC_KEY_HERE",
       "peer_public_key": "PEER_PUBLIC_KEY_HERE",
       "peer_endpoint": "frankfurt.vpnprovider.com:51820",
       "vpn_assigned_ip": "10.65.0.3/32",
       "veth_network": "192.168.2.0/30",
       "routing_table_id": 7002,
-      "routing_table_name": "vpn2_tbl",
-      "router_lan_interface": "br0"
+      "routing_table_name": "vpn2_tbl"
     }
   ]
 }
