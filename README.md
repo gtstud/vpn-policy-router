@@ -88,10 +88,18 @@ sudo /usr/local/bin/vpn-assign.py add \
 
 ### Removing a Client Assignment
 
-To remove an assignment, use the `remove` command and specify the client's display name.
+To remove a single assignment, use the `remove` command and specify the client's display name.
 
 ```bash
 sudo /usr/local/bin/vpn-assign.py remove --display-name "Work-Laptop"
+```
+
+### Removing All Assignments
+
+To remove all client assignments at once, use the `remove-all` command. For safety, you will be prompted for confirmation.
+
+```bash
+sudo /usr/local/bin/vpn-assign.py remove-all
 ```
 
 Changes made with `vpn-assign.py` are applied immediately by automatically triggering the `vpn-apply.py` script.

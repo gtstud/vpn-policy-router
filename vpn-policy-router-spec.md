@@ -129,6 +129,8 @@ The script MUST use Python's `argparse` module with subparsers to provide a stan
     *   `--duration`: An optional assignment duration (e.g., `30m`, `2h`, `1d`). If omitted, the assignment is permanent.
 *   **Remove Command:** `vpn-assign.py remove --display-name <name>`
     *   **Action:** Removes the client assignment matching the specified `--display-name`.
+*   **Remove All Command:** `vpn-assign.py remove-all`
+    *   **Action:** Removes all client assignments after prompting the user for confirmation.
 
 #### 4.2.2 Logic and Workflow
 
