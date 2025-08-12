@@ -47,9 +47,13 @@ This file is the static source of truth for the VPN infrastructure.
 | `peer_endpoint` | String | The `hostname:port` of the remote WireGuard server. |
 | `vpn_assigned_ip` | String (CIDR) | The IP address assigned to the client by the VPN provider (e.g., "10.64.0.2/32"). |
 | `veth_network` | String (CIDR) | A private `/30` network used for the veth pair connecting the namespace to the main router. |
-| `routing_table_id` | Integer | A unique numeric ID (1-252) for the policy routing table. |
+| `routing_table_id` | Integer | A unique numeric ID for the policy routing table. **MUST** be within the `routing_table_id_range`. |
 | `routing_table_name`| String | A unique string name for the policy routing table (e.g., "vpnX_tbl"). |
 | `system_config.firewalld.zone_vpn` | String | The `firewalld` zone where the host-side `veth` interfaces of active VPNs will be placed. |
+| `system_config.veth_network_range.prefix` | String | A string prefix (e.g., "10.239") that all `veth_network` values must start with. |
+| `system_config.routing_table_id_range` | Object | An object defining the allowable range for `routing_table_id` values. |
+| `routing_table_id_range.min` | Integer | The minimum allowable `routing_table_id`. |
+| `routing_table_id_range.max` | Integer | The maximum allowable `routing_table_id`. |
 
 ### 3.2 `vpn-clients.json`
 
@@ -108,23 +112,34 @@ The script performs validation on startup, checking for:
 
 ### 4.2 Client Assignment Script: `vpn-assign.py`
 
-*   **Purpose:** To provide a non-interactive, user-friendly CLI for managing the `vpn-clients.json` file.
+*   **Purpose:** To provide a clear, subcommand-based CLI for managing the `vpn-clients.json` file.
 *   **Execution:** Run manually as root from the command line.
 
 #### 4.2.1 Command-Line Interface (CLI) Specification
 
-The script MUST use Python's `argparse` module to provide a standard, non-interactive CLI.
+The script MUST use Python's `argparse` module with subparsers to provide a standard, non-interactive CLI. When run with no arguments, it MUST display the help text followed by the output of the `list` command.
 
-*   **List Mode:** `vpn-assign.py --list`
-*   **Create/Modify Mode:** `vpn-assign.py --display-name <name> --vpn <vpn_name> [--ip <ip> | --hostname <host>] [--duration <duration>]`
+*   **List Command:** `vpn-assign.py list`
+    *   **Action:** Displays all available VPN definitions and a list of all current client assignments, including their expiry status.
+*   **Add/Update Command:** `vpn-assign.py add --display-name <name> --vpn <vpn_name> (--ip <ip> | --hostname <host>) [--duration <d>]`
+    *   **Action:** Creates a new client assignment or updates an existing one identified by `--display-name`.
+    *   `--display-name`: The mandatory, unique, human-readable name for the client.
+    *   `--vpn`: The name of the VPN to assign (must exist in `vpn-definitions.json`).
+    *   `--ip` or `--hostname`: A mandatory, mutually exclusive identifier for the client.
+    *   `--duration`: An optional assignment duration (e.g., `30m`, `2h`, `1d`). If omitted, the assignment is permanent.
+*   **Remove Command:** `vpn-assign.py remove --display-name <name>`
+    *   **Action:** Removes the client assignment matching the specified `--display-name`.
+*   **Remove All Command:** `vpn-assign.py remove-all`
+    *   **Action:** Immediately removes all client assignments. A warning is printed to the console.
 
 #### 4.2.2 Logic and Workflow
 
-1.  **Parse arguments.**
-2.  **Acquire a file lock** on `vpn-clients.json` and read the data.
-3.  **Find or Create Client** based on `--display-name`.
-4.  **Update Client Data:** Update the `assigned_vpn` and calculate the `assignment_expiry`.
-5.  **Write and Trigger:** Write the modified data back to `vpn-clients.json`, release the lock, and trigger `vpn-apply.py` to immediately enforce the change.
+1.  **Parse Subcommand and Arguments:** The script determines which command (`list`, `add`, `remove`) was invoked.
+2.  **Acquire File Lock:** To prevent race conditions, the script should acquire a lock on `vpn-clients.json` before reading or writing.
+3.  **Perform Action:**
+    *   For `add`, it finds an existing client by `display_name` to update, or appends a new assignment object to the list.
+    *   For `remove`, it filters the list, removing the client object with the matching `display_name`.
+4.  **Write and Trigger:** The script writes the modified data back to `vpn-clients.json`, releases the lock, and triggers `vpn-apply.py` to immediately enforce the change.
 
 ## 5.0 Automation and Persistence
 
