@@ -1,6 +1,6 @@
 [Unit]
 Description=Declarative Policy-Based VPN Router
-After=network.target systemd-networkd.service
+After=network.target
 Documentation=https://github.com/gtstudis/vpn-policy-router
 
 [Service]
