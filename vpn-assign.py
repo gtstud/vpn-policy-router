@@ -218,7 +218,7 @@ def handle_remove_assignment(args: argparse.Namespace):
         apply_configuration(args.verbose)
 
 def handle_remove_all_assignments(args: argparse.Namespace):
-    """Removes all client assignments after user confirmation."""
+    """Removes all client assignments."""
     removed = False
     try:
         with open(VPN_CLIENTS_PATH, 'a+') as f:
@@ -235,17 +235,7 @@ def handle_remove_all_assignments(args: argparse.Namespace):
                 logger.info("No assignments to remove.")
                 return
 
-            print(f"\033[93mWARNING: This will permanently remove all {len(assignments)} client assignments.\033[0m")
-            try:
-                confirm = input("Are you sure you want to continue? [y/N] ")
-                if confirm.lower() != 'y':
-                    logger.info("Operation cancelled.")
-                    return
-            except (EOFError, KeyboardInterrupt):
-                logger.info("\nOperation cancelled.")
-                return
-
-            logger.info("Removing all client assignments...")
+            logger.warning(f"Removing all {len(assignments)} client assignments. This action is irreversible.")
             clients_data["assignments"] = []
 
             f.seek(0)

@@ -96,7 +96,7 @@ sudo /usr/local/bin/vpn-assign.py remove --display-name "Work-Laptop"
 
 ### Removing All Assignments
 
-To remove all client assignments at once, use the `remove-all` command. For safety, you will be prompted for confirmation.
+To remove all client assignments at once, use the `remove-all` command. **Warning:** This action is immediate and irreversible.
 
 ```bash
 sudo /usr/local/bin/vpn-assign.py remove-all

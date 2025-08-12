@@ -130,7 +130,7 @@ The script MUST use Python's `argparse` module with subparsers to provide a stan
 *   **Remove Command:** `vpn-assign.py remove --display-name <name>`
     *   **Action:** Removes the client assignment matching the specified `--display-name`.
 *   **Remove All Command:** `vpn-assign.py remove-all`
-    *   **Action:** Removes all client assignments after prompting the user for confirmation.
+    *   **Action:** Immediately removes all client assignments. A warning is printed to the console.
 
 #### 4.2.2 Logic and Workflow
 
