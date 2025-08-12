@@ -289,6 +289,20 @@ class VPNRouter:
         logger.warning(f"Could not find route/interface for local IP: {ip_address}")
         return None
 
+    def _get_table_default_route(self, table_name):
+        """Check for a default route in a specific routing table."""
+        cmd = ['ip', '-j', 'route', 'show', 'table', table_name]
+        result = self._run_cmd(cmd, check=False)
+        if not result or result.returncode != 0:
+            return None
+        try:
+            route_info = json.loads(result.stdout)
+            for route in route_info:
+                if route.get("dst") == "default":
+                    return {"gateway": route.get("gateway"), "dev": route.get("dev")}
+        except (json.JSONDecodeError, IndexError):
+            return None
+        return None
 
     def _apply_vpn_config(self, vpn):
         vpn_name = vpn["name"]
@@ -297,6 +311,7 @@ class VPNRouter:
         wg_if = f"v-{vpn_name}-w"
         host_ip, ns_ip = self._get_network_addresses(vpn["veth_network"])
         host_ip_full, ns_ip_full = f"{host_ip}/30", f"{ns_ip}/30"
+        table_name = vpn["routing_table_name"]
 
         logger.info(f"Applying network configuration for VPN '{vpn_name}'...")
 
@@ -377,6 +392,15 @@ class VPNRouter:
         self._run_cmd(['ip', 'netns', 'exec', ns_name, 'nft', 'add', 'table', 'ip', 'nat'], check=False)
         self._run_cmd(['ip', 'netns', 'exec', ns_name, 'nft', 'add', 'chain', 'ip', 'nat', 'POSTROUTING', '{ type nat hook postrouting priority 100 ; }'], check=False)
         self._run_cmd(['ip', 'netns', 'exec', ns_name, 'nft', 'add', 'rule', 'ip', 'nat', 'POSTROUTING', 'oifname', wg_if, 'masquerade'], check=False)
+
+        # 10. Add route to custom table to direct traffic into the namespace
+        logger.info(f"Synchronizing route for table '{table_name}'")
+        current_route = self._get_table_default_route(table_name)
+        desired_route = {"gateway": ns_ip, "dev": host_veth}
+        if current_route != desired_route:
+            logger.info(f"Adding default route to table '{table_name}' via {ns_ip} dev {host_veth}")
+            self._run_cmd(['ip', 'route', 'replace', 'default', 'via', ns_ip, 'dev', host_veth, 'table', table_name])
+            self.changed_files.add(f"route_table_{table_name}")
 
 
     def _sync_routing_rules(self, resolved_clients_map):
