@@ -269,7 +269,7 @@ class VPNRouter:
             return rules
         # Example output: 32765:	from 192.168.1.10 lookup vpnX_tbl
         for line in result.stdout.strip().split('\n'):
-            match = re.search(r'from\s+([0-9\.]+)\s+lookup\s+([a-zA-Z0-9_]+)', line)
+            match = re.search(r'from\s+([0-9\.]+)\s+lookup\s+([a-zA-Z0-9_-]+)', line)
             if match:
                 rules.add((match.group(1), match.group(2)))
         return rules
